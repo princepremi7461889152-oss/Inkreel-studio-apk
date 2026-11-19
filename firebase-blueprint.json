@@ -1,0 +1,124 @@
+{
+  "entities": {
+    "Reel": {
+      "title": "Reel",
+      "description": "A user-created 9:16 monochrome stickman comedy reel project with cast profiles, audio settings, and timed storyboard shots.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID."
+        },
+        "title": {
+          "type": "string",
+          "description": "Short comedy reel title."
+        },
+        "socialCaption": {
+          "type": "string",
+          "description": "Viral social caption for Reels/Shorts."
+        },
+        "hashtags": {
+          "type": "array",
+          "description": "Up to 15 hashtags for social sharing."
+        },
+        "niche": {
+          "type": "string",
+          "description": "Selected comedy niche or custom topic."
+        },
+        "twistStructure": {
+          "type": "string",
+          "description": "Comedy twist structure used."
+        },
+        "language": {
+          "type": "string",
+          "enum": ["English", "Hinglish", "Hindi"],
+          "description": "Spoken dialogue language."
+        },
+        "setting": {
+          "type": "string",
+          "enum": ["CLASSROOM", "OFFICE", "HOSPITAL", "INTERVIEW_ROOM", "COFFEE_SHOP", "GYM", "LIVING_ROOM"],
+          "description": "Architectural monochrome room setting."
+        },
+        "bgmMood": {
+          "type": "string",
+          "enum": ["QUIRKY_COMEDY", "DRAMATIC_SUSPENSE", "CHAOTIC_CHASE", "WHOLESOME_CHILL"],
+          "description": "Procedural background music mood."
+        },
+        "bgmVolume": {
+          "type": "number",
+          "description": "Background music gain from 0.0 to 1.0."
+        },
+        "captionStyle": {
+          "type": "string",
+          "enum": ["CLASSIC", "WORD_POP"],
+          "description": "Caption animation style."
+        },
+        "captionPosition": {
+          "type": "string",
+          "enum": ["BOTTOM_THIRD", "CENTER_POP"],
+          "description": "Vertical placement of captions on the 9:16 stage."
+        },
+        "watermarkHandle": {
+          "type": "string",
+          "description": "Custom @channel watermark rendered on the reel."
+        },
+        "exportResolution": {
+          "type": "string",
+          "enum": ["HD_720P", "FHD_1080P"],
+          "description": "Target 9:16 export resolution."
+        },
+        "clonedStyleSummary": {
+          "type": "string",
+          "description": "Extracted pacing blueprint summary from Clone Style mode."
+        },
+        "characters": {
+          "type": "array",
+          "description": "Up to 3 character cast profiles (A, B, C)."
+        },
+        "shots": {
+          "type": "array",
+          "description": "Up to 20 ordered storyboard shots."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set on creation via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp updated on modification via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "socialCaption",
+        "hashtags",
+        "niche",
+        "twistStructure",
+        "language",
+        "setting",
+        "bgmMood",
+        "bgmVolume",
+        "captionStyle",
+        "captionPosition",
+        "watermarkHandle",
+        "exportResolution",
+        "clonedStyleSummary",
+        "characters",
+        "shots",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/reels/{reelId}": {
+      "schema": {
+        "$ref": "#/entities/Reel"
+      },
+      "description": "User-owned saved comedy reel projects scoped strictly to the authenticated owner."
+    }
+  }
+}

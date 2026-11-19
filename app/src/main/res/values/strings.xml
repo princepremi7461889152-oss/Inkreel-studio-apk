@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">InkReel Studio</string>
+    <string name="studio_tagline">9:16 Monochrome Stickman Comedy Studio</string>
+    <string name="sign_in_google">Sign in with Google</string>
+    <string name="export_mp4">Export MP4</string>
+    <string name="saved_reels">Saved Reels</string>
+</resources>

@@ -1,0 +1,118 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: default deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidLanguage(lang) {
+      return lang in ['English', 'Hinglish', 'Hindi'];
+    }
+
+    function isValidSetting(setting) {
+      return setting in ['CLASSROOM', 'OFFICE', 'HOSPITAL', 'INTERVIEW_ROOM', 'COFFEE_SHOP', 'GYM', 'LIVING_ROOM'];
+    }
+
+    function isValidBgmMood(mood) {
+      return mood in ['QUIRKY_COMEDY', 'DRAMATIC_SUSPENSE', 'CHAOTIC_CHASE', 'WHOLESOME_CHILL'];
+    }
+
+    function isValidCaptionStyle(style) {
+      return style in ['CLASSIC', 'WORD_POP'];
+    }
+
+    function isValidCaptionPosition(pos) {
+      return pos in ['BOTTOM_THIRD', 'CENTER_POP'];
+    }
+
+    function isValidResolution(res) {
+      return res in ['HD_720P', 'FHD_1080P'];
+    }
+
+    function isValidReel(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+             data.socialCaption is string && data.socialCaption.size() <= 500 &&
+             data.hashtags is list && data.hashtags.size() <= 15 &&
+             (data.hashtags.size() == 0 || data.hashtags[0] is string) &&
+             data.niche is string && data.niche.size() >= 1 && data.niche.size() <= 80 &&
+             data.twistStructure is string && data.twistStructure.size() >= 1 && data.twistStructure.size() <= 80 &&
+             data.language is string && isValidLanguage(data.language) &&
+             data.setting is string && isValidSetting(data.setting) &&
+             data.bgmMood is string && isValidBgmMood(data.bgmMood) &&
+             (data.bgmVolume is number) && data.bgmVolume >= 0.0 && data.bgmVolume <= 1.0 &&
+             data.captionStyle is string && isValidCaptionStyle(data.captionStyle) &&
+             data.captionPosition is string && isValidCaptionPosition(data.captionPosition) &&
+             data.watermarkHandle is string && data.watermarkHandle.size() <= 40 &&
+             data.exportResolution is string && isValidResolution(data.exportResolution) &&
+             data.clonedStyleSummary is string && data.clonedStyleSummary.size() <= 600 &&
+             data.characters is list && data.characters.size() <= 3 &&
+             (data.characters.size() == 0 || data.characters[0] is map) &&
+             data.shots is list && data.shots.size() <= 20 &&
+             (data.shots.size() == 0 || data.shots[0] is map) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /users/{userId}/reels/{reelId} {
+      allow get: if isOwner(userId) && isValidId(reelId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(reelId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'title', 'socialCaption', 'hashtags', 'niche',
+                         'twistStructure', 'language', 'setting', 'bgmMood', 'bgmVolume',
+                         'captionStyle', 'captionPosition', 'watermarkHandle',
+                         'exportResolution', 'clonedStyleSummary', 'characters',
+                         'shots', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'title', 'socialCaption', 'hashtags', 'niche',
+                         'twistStructure', 'language', 'setting', 'bgmMood', 'bgmVolume',
+                         'captionStyle', 'captionPosition', 'watermarkHandle',
+                         'exportResolution', 'clonedStyleSummary', 'characters',
+                         'shots', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidReel(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(reelId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidReel(incoming(), userId) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'title', 'socialCaption', 'hashtags', 'niche',
+                         'twistStructure', 'language', 'setting', 'bgmMood', 'bgmVolume',
+                         'captionStyle', 'captionPosition', 'watermarkHandle',
+                         'exportResolution', 'clonedStyleSummary', 'characters',
+                         'shots', 'updatedAt'
+                       ]);
+
+      allow delete: if isOwner(userId) && isValidId(reelId);
+    }
+  }
+}

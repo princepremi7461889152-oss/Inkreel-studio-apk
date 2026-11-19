@@ -1,0 +1,6 @@
+{
+  "name": "InkReel Studio",
+  "description": "9:16 monochrome 2D stickman comedy reel studio with AI storyboarding, multi-speaker voiceovers, procedural comic SFX, and MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
