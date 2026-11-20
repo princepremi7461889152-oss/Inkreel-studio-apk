@@ -50,13 +50,15 @@ class InkReelBugFixTest {
     @Test
     fun geminiService_offlineHooksAndFallbackStoryboardNeverEmpty() {
         val service = GeminiInkReelService()
-        val hooks = service.buildOfflineHooks("Gym & Trainer", "Rule of 3", "Hinglish")
-        assertEquals(5, hooks.size)
-        assertTrue(hooks.all { it.isNotBlank() })
+        val hooks1 = service.buildOfflineHooks("Gym & Trainer", "Rule of 3", "Hinglish")
+        val hooks2 = service.buildOfflineHooks("Gym & Trainer", "Rule of 3", "Hinglish")
+        assertEquals(5, hooks1.size)
+        assertTrue(hooks1.all { it.isNotBlank() })
+        assertTrue("Repeated hook brainstorming should rotate hooks", hooks1.first() != hooks2.first())
 
         val base = ReelProject(watermarkHandle = "@creator_prince")
         NichePreset.entries.forEach { preset ->
-            val proj = service.buildFallbackNicheStoryboard(
+            val first = service.buildFallbackNicheStoryboard(
                 niche = preset.label,
                 twist = "Plot Twist",
                 language = "Hinglish",
@@ -64,11 +66,55 @@ class InkReelBugFixTest {
                 clonedSummary = "",
                 baseProject = base
             )
-            assertTrue("Shots should be >= 6 for ${preset.label}", proj.shots.size >= 6)
-            assertEquals("@creator_prince", proj.watermarkHandle)
-            assertTrue(proj.characters.any { it.gender == CharacterGender.FEMALE })
-            assertTrue(proj.shots.any { it.activity != CharacterActivity.TALKING })
+            val second = service.buildFallbackNicheStoryboard(
+                niche = preset.label,
+                twist = "Plot Twist",
+                language = "Hinglish",
+                hook = "",
+                clonedSummary = "",
+                baseProject = base
+            )
+            assertTrue("Shots should be >= 6 for ${preset.label}", first.shots.size >= 6)
+            assertEquals("@creator_prince", first.watermarkHandle)
+            assertTrue(first.characters.any { it.gender == CharacterGender.FEMALE })
+            assertTrue(first.shots.any { it.activity != CharacterActivity.TALKING })
+            assertTrue(
+                "Consecutive generations for ${preset.label} should vary titles (${first.title} vs ${second.title})",
+                first.title != second.title
+            )
+            assertTrue(
+                "Consecutive generations for ${preset.label} should vary opening line",
+                first.shots.first().dialogue != second.shots.first().dialogue
+            )
         }
+    }
+
+    @Test
+    fun geminiService_doctorPatientUsesHospitalCastAndNeverRepeatsOfficeClientScript() {
+        val service = GeminiInkReelService()
+        val base = ReelProject()
+        val docRun1 = service.buildFallbackNicheStoryboard(
+            niche = "Doctor & Patient",
+            twist = "Plot Twist",
+            language = "Hinglish",
+            hook = "",
+            clonedSummary = "",
+            baseProject = base
+        )
+        val docRun2 = service.buildFallbackNicheStoryboard(
+            niche = "Doctor & Patient",
+            twist = "Plot Twist",
+            language = "Hinglish",
+            hook = "",
+            clonedSummary = "",
+            baseProject = base
+        )
+
+        assertEquals(RoomSetting.HOSPITAL, docRun1.setting)
+        assertEquals("Dr. Mehta", docRun1.characters.first().name)
+        assertTrue(docRun1.title != docRun2.title)
+        assertFalse(docRun1.shots.any { it.dialogue.contains("client ko mera reel", ignoreCase = true) })
+        assertFalse(docRun2.shots.any { it.dialogue.contains("client ko mera reel", ignoreCase = true) })
     }
 
     @Test

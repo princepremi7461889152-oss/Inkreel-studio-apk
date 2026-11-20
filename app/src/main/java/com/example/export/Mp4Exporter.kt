@@ -33,7 +33,7 @@ data class ExportResult(
 object Mp4Exporter {
 
     private const val TAG = "Mp4Exporter"
-    private const val FPS = 24
+    private const val FPS = 20
     private const val VIDEO_MIME = MediaFormat.MIMETYPE_VIDEO_AVC
     private const val AUDIO_MIME = MediaFormat.MIMETYPE_AUDIO_AAC
 
@@ -128,18 +128,19 @@ object Mp4Exporter {
         try {
             val videoFormat = MediaFormat.createVideoFormat(VIDEO_MIME, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, if (width >= 1080) 4_200_000 else 2_500_000)
+                setInteger(MediaFormat.KEY_BIT_RATE, if (width >= 1080) 3_600_000 else 2_200_000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 }
             }
-            videoEncoder = MediaCodec.createEncoderByType(VIDEO_MIME).apply {
+            val activeVideoEncoder = MediaCodec.createEncoderByType(VIDEO_MIME).apply {
                 configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             }
-            val inputSurface = videoEncoder.createInputSurface()
-            videoEncoder.start()
+            videoEncoder = activeVideoEncoder
+            val inputSurface = activeVideoEncoder.createInputSurface()
+            activeVideoEncoder.start()
 
             val audioFormat = MediaFormat.createAudioFormat(
                 AUDIO_MIME,
@@ -150,41 +151,41 @@ object Mp4Exporter {
                 setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
             }
-            audioEncoder = MediaCodec.createEncoderByType(AUDIO_MIME).apply {
+            val activeAudioEncoder = MediaCodec.createEncoderByType(AUDIO_MIME).apply {
                 configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 start()
             }
+            audioEncoder = activeAudioEncoder
 
-            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val activeMuxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = activeMuxer
             var videoTrackIndex = -1
             var audioTrackIndex = -1
             var muxerStarted = false
+            var videoEosSeen = false
+            var audioEosSeen = false
 
             val videoBufferInfo = MediaCodec.BufferInfo()
             val audioBufferInfo = MediaCodec.BufferInfo()
             val fixedVideoInfo = MediaCodec.BufferInfo()
             var encodedVideoFrames = 0L
+            var lastAudioPtsUs = -1L
 
-            // Non-blocking drain during rendering loop (0 us) to eliminate per-frame codec polling sleep
-            fun drainEncoder(encoder: MediaCodec, info: MediaCodec.BufferInfo, isVideo: Boolean, endOfStream: Boolean) {
-                if (endOfStream && isVideo) {
-                    encoder.signalEndOfInputStream()
-                }
-                val timeoutUs = if (endOfStream) 2_000L else 0L
-                while (true) {
+            fun drainAvailable(encoder: MediaCodec, info: MediaCodec.BufferInfo, isVideo: Boolean, timeoutUs: Long) {
+                var iterations = 0
+                while (iterations < 64) {
+                    iterations++
                     val outIdx = encoder.dequeueOutputBuffer(info, timeoutUs)
                     when {
-                        outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                            if (!endOfStream) break
-                        }
+                        outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> break
                         outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            if (isVideo) {
-                                videoTrackIndex = muxer.addTrack(encoder.outputFormat)
-                            } else {
-                                audioTrackIndex = muxer.addTrack(encoder.outputFormat)
+                            if (isVideo && videoTrackIndex < 0) {
+                                videoTrackIndex = activeMuxer.addTrack(encoder.outputFormat)
+                            } else if (!isVideo && audioTrackIndex < 0) {
+                                audioTrackIndex = activeMuxer.addTrack(encoder.outputFormat)
                             }
                             if (videoTrackIndex >= 0 && audioTrackIndex >= 0 && !muxerStarted) {
-                                muxer.start()
+                                activeMuxer.start()
                                 muxerStarted = true
                             }
                         }
@@ -196,14 +197,18 @@ object Mp4Exporter {
                                 if (isVideo) {
                                     val ptsUs = (encodedVideoFrames * 1_000_000L) / FPS
                                     fixedVideoInfo.set(info.offset, info.size, ptsUs, info.flags)
-                                    muxer.writeSampleData(videoTrackIndex, encodedBuf, fixedVideoInfo)
+                                    activeMuxer.writeSampleData(videoTrackIndex, encodedBuf, fixedVideoInfo)
                                     encodedVideoFrames++
                                 } else {
-                                    muxer.writeSampleData(audioTrackIndex, encodedBuf, info)
+                                    val safePtsUs = if (info.presentationTimeUs > lastAudioPtsUs) info.presentationTimeUs else (lastAudioPtsUs + 1L)
+                                    lastAudioPtsUs = safePtsUs
+                                    fixedVideoInfo.set(info.offset, info.size, safePtsUs, info.flags)
+                                    activeMuxer.writeSampleData(audioTrackIndex, encodedBuf, fixedVideoInfo)
                                 }
                             }
                             encoder.releaseOutputBuffer(outIdx, false)
                             if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                                if (isVideo) videoEosSeen = true else audioEosSeen = true
                                 break
                             }
                         }
@@ -219,41 +224,47 @@ object Mp4Exporter {
             fun stepAudioFeed(maxChunks: Int = 4, waitUs: Long = 0L) {
                 var fed = 0
                 while (!audioEosSent && fed < maxChunks) {
-                    val inIdx = audioEncoder.dequeueInputBuffer(waitUs)
+                    val inIdx = activeAudioEncoder.dequeueInputBuffer(waitUs)
                     if (inIdx < 0) break
-                    val buf = audioEncoder.getInputBuffer(inIdx) ?: break
+                    val buf = activeAudioEncoder.getInputBuffer(inIdx) ?: break
                     buf.clear()
                     val ptsUs = (audioSamplesFed * 1_000_000L) / ProceduralAudioEngine.SAMPLE_RATE
                     if (audioBytePos >= mixedPcm.size) {
-                        audioEncoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        activeAudioEncoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                         audioEosSent = true
                     } else {
                         val toWrite = minOf(audioChunkSize, buf.capacity(), mixedPcm.size - audioBytePos)
                         buf.put(mixedPcm, audioBytePos, toWrite)
                         audioBytePos += toWrite
                         audioSamplesFed += (toWrite / 2)
-                        audioEncoder.queueInputBuffer(inIdx, 0, toWrite, ptsUs, 0)
+                        activeAudioEncoder.queueInputBuffer(inIdx, 0, toWrite, ptsUs, 0)
                     }
                     fed++
                 }
             }
 
-            // Pre-warm audio format so muxer starts cleanly
-            for (warm in 0 until 8) {
-                stepAudioFeed(maxChunks = 2, waitUs = 1_000L)
-                val outIdx = audioEncoder.dequeueOutputBuffer(audioBufferInfo, 1_500L)
-                if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    audioTrackIndex = muxer.addTrack(audioEncoder.outputFormat)
-                    break
-                } else if (outIdx >= 0) {
-                    audioEncoder.releaseOutputBuffer(outIdx, false)
-                }
+            // Pre-warm audio format so muxer starts immediately when frame 0's keyframe arrives
+            for (warm in 0 until 40) {
+                stepAudioFeed(maxChunks = 2, waitUs = 3_000L)
+                drainAvailable(activeAudioEncoder, audioBufferInfo, isVideo = false, timeoutUs = 3_000L)
+                if (audioTrackIndex >= 0) break
             }
 
-            // Render directly onto encoder InputSurface Canvas (no offscreen bitmap copy overhead)
+            var hardwareCanvasSupported = true
+
+            // Render directly onto encoder InputSurface via GPU-accelerated lockHardwareCanvas (with safe fallback)
             for (frame in 0 until totalFrames) {
                 val playheadMs = (frame * 1000L) / FPS
-                val surfCanvas = inputSurface.lockCanvas(null)
+                val surfCanvas = if (hardwareCanvasSupported) {
+                    try {
+                        inputSurface.lockHardwareCanvas()
+                    } catch (_: Throwable) {
+                        hardwareCanvasSupported = false
+                        inputSurface.lockCanvas(null)
+                    }
+                } else {
+                    inputSurface.lockCanvas(null)
+                }
                 try {
                     StickmanRenderer.renderFrame(
                         canvas = surfCanvas,
@@ -270,20 +281,45 @@ object Mp4Exporter {
                 }
 
                 stepAudioFeed(maxChunks = 4, waitUs = 0L)
-                drainEncoder(videoEncoder, videoBufferInfo, isVideo = true, endOfStream = false)
-                drainEncoder(audioEncoder, audioBufferInfo, isVideo = false, endOfStream = false)
-                if (frame % 12 == 0) {
-                    onProgress((frame.toFloat() / totalFrames.toFloat()).coerceIn(0f, 0.96f))
+                if (!videoEosSeen) {
+                    drainAvailable(activeVideoEncoder, videoBufferInfo, isVideo = true, timeoutUs = 0L)
+                }
+                if (!audioEosSeen) {
+                    drainAvailable(activeAudioEncoder, audioBufferInfo, isVideo = false, timeoutUs = 0L)
+                }
+                if (frame % 10 == 0) {
+                    onProgress((frame.toFloat() / totalFrames.toFloat() * 0.92f).coerceIn(0.02f, 0.92f))
                 }
             }
 
-            // Flush remaining audio + video EOS
-            while (!audioEosSent) {
-                stepAudioFeed(maxChunks = 4, waitUs = 1_000L)
-                drainEncoder(audioEncoder, audioBufferInfo, isVideo = false, endOfStream = false)
+            onProgress(0.95f)
+            activeVideoEncoder.signalEndOfInputStream()
+
+            // Bounded concurrent flush so EOS never hangs at 96% even on strict OEM hardware codecs
+            val flushDeadlineMs = System.currentTimeMillis() + 6_000L
+            while ((!videoEosSeen || !audioEosSeen) && System.currentTimeMillis() < flushDeadlineMs) {
+                if (!audioEosSent) {
+                    stepAudioFeed(maxChunks = 8, waitUs = 1_000L)
+                }
+                if (!videoEosSeen) {
+                    drainAvailable(activeVideoEncoder, videoBufferInfo, isVideo = true, timeoutUs = 2_000L)
+                }
+                if (!audioEosSeen) {
+                    drainAvailable(activeAudioEncoder, audioBufferInfo, isVideo = false, timeoutUs = 2_000L)
+                }
             }
-            drainEncoder(videoEncoder, videoBufferInfo, isVideo = true, endOfStream = true)
-            drainEncoder(audioEncoder, audioBufferInfo, isVideo = false, endOfStream = true)
+            onProgress(0.98f)
+
+            // Stop & finalize muxer cleanly BEFORE publishing to Downloads so the MP4 moov atom is flushed
+            runCatching { activeVideoEncoder.stop(); activeVideoEncoder.release() }
+            videoEncoder = null
+            runCatching { activeAudioEncoder.stop(); activeAudioEncoder.release() }
+            audioEncoder = null
+            if (muxerStarted) {
+                activeMuxer.stop()
+            }
+            activeMuxer.release()
+            muxer = null
             onProgress(1f)
 
             // Save a copy into Android Downloads (API 29+) so user finds it immediately
