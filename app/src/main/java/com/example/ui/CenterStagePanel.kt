@@ -7,6 +7,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -97,14 +98,16 @@ fun CenterStagePanel(
         border = BorderStroke(1.dp, HairlineBorder),
         shape = MaterialTheme.shapes.large
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val stageMaxWidth = if (maxWidth < 460.dp) 200.dp else 268.dp
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
             // Stage Header + Reference Switcher
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -153,7 +156,7 @@ fun CenterStagePanel(
             // 9:16 Vertical Stage Viewport
             Card(
                 modifier = Modifier
-                    .widthIn(max = 280.dp)
+                    .widthIn(max = stageMaxWidth)
                     .fillMaxWidth()
                     .aspectRatio(9f / 16f),
                 border = BorderStroke(2.dp, InkBlack),
@@ -443,6 +446,7 @@ fun CenterStagePanel(
                         tint = InkBlack
                     )
                 }
+            }
             }
         }
     }

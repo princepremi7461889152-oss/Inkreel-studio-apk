@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -114,45 +115,60 @@ fun InkReelStudioScreen(
                     val isCompactHeader = maxWidth < 680.dp
 
                     val headerActions: @Composable () -> Unit = {
+                        val btnPadding = if (isCompactHeader) {
+                            PaddingValues(horizontal = 10.dp, vertical = 0.dp)
+                        } else {
+                            ButtonDefaults.ContentPadding
+                        }
                         Row(
                             modifier = Modifier.horizontalScroll(rememberScrollState()),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             OutlinedButton(
                                 onClick = { viewModel.openApiKeyDialog() },
+                                contentPadding = btnPadding,
                                 modifier = Modifier.height(42.dp).testTag("header_api_key_button")
                             ) {
-                                Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(15.dp))
                                 Spacer(Modifier.size(4.dp))
                                 Text(
-                                    text = if (apiKey.isBlank()) "Set API Key" else "API Key ✓",
-                                    style = MaterialTheme.typography.bodySmall
+                                    text = when {
+                                        apiKey.isBlank() && isCompactHeader -> "Key"
+                                        apiKey.isBlank() -> "Set API Key"
+                                        isCompactHeader -> "Key ✓"
+                                        else -> "API Key ✓"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 1
                                 )
                             }
 
                             OutlinedButton(
                                 onClick = { showSavedSheet = true },
+                                contentPadding = btnPadding,
                                 modifier = Modifier.height(42.dp).testTag("saved_reels_button")
                             ) {
-                                Icon(Icons.Filled.VideoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Icon(Icons.Filled.VideoLibrary, contentDescription = null, modifier = Modifier.size(15.dp))
                                 Spacer(Modifier.size(4.dp))
-                                Text("Reels (${savedReels.size})", style = MaterialTheme.typography.bodySmall)
+                                Text("Reels (${savedReels.size})", style = MaterialTheme.typography.bodySmall, maxLines = 1)
                             }
 
                             OutlinedButton(
                                 onClick = { viewModel.saveCurrentReel() },
                                 enabled = !state.isSavingReel,
+                                contentPadding = btnPadding,
                                 modifier = Modifier.height(42.dp).testTag("save_reel_button")
                             ) {
-                                Icon(Icons.Filled.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Icon(Icons.Filled.Bookmark, contentDescription = null, modifier = Modifier.size(15.dp))
                                 Spacer(Modifier.size(4.dp))
-                                Text(if (state.isSavingReel) "Saving..." else "Save", style = MaterialTheme.typography.bodySmall)
+                                Text(if (state.isSavingReel) "Saving..." else "Save", style = MaterialTheme.typography.bodySmall, maxLines = 1)
                             }
 
                             Button(
                                 onClick = { viewModel.exportMp4(context) },
                                 enabled = !state.isExportingMp4,
+                                contentPadding = btnPadding,
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = InkBlack,
                                     contentColor = StudioWhite
@@ -161,16 +177,16 @@ fun InkReelStudioScreen(
                             ) {
                                 if (state.isExportingMp4) {
                                     CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
+                                        modifier = Modifier.size(15.dp),
                                         color = StudioWhite,
                                         strokeWidth = 2.dp
                                     )
-                                    Spacer(Modifier.size(6.dp))
+                                    Spacer(Modifier.size(4.dp))
                                     Text("${(state.exportProgress * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
                                 } else {
-                                    Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(15.dp))
                                     Spacer(Modifier.size(4.dp))
-                                    Text("Download MP4", style = MaterialTheme.typography.bodySmall)
+                                    Text(if (isCompactHeader) "MP4" else "Download MP4", style = MaterialTheme.typography.bodySmall, maxLines = 1)
                                 }
                             }
                         }

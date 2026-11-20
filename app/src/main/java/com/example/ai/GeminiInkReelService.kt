@@ -82,7 +82,7 @@ class GeminiInkReelService {
             }
 
             val responseJson = withTimeout(60_000L) {
-                callGeminiRest(apiKey, TEXT_MODEL, body)
+                callGeminiTextWithFallback(apiKey, body)
             }
             val text = extractTextFromResponse(responseJson)
             val parsed = JSONObject(text)
@@ -151,7 +151,7 @@ class GeminiInkReelService {
             }
 
             val responseJson = withTimeout(60_000L) {
-                callGeminiRest(apiKey, TEXT_MODEL, body)
+                callGeminiTextWithFallback(apiKey, body)
             }
             val rawText = extractTextFromResponse(responseJson)
             val parsed = parseStoryboardJson(
@@ -214,7 +214,7 @@ class GeminiInkReelService {
             }
 
             val responseJson = withTimeout(60_000L) {
-                callGeminiRest(apiKey, TEXT_MODEL, body)
+                callGeminiTextWithFallback(apiKey, body)
             }
             val rawText = extractTextFromResponse(responseJson)
             val parsed = parseStoryboardJson(
@@ -461,7 +461,7 @@ class GeminiInkReelService {
             }
 
             val responseJson = withTimeout(60_000L) {
-                callGeminiRest(apiKey, TEXT_MODEL, body)
+                callGeminiTextWithFallback(apiKey, body)
             }
             val json = JSONObject(extractTextFromResponse(responseJson))
             val framingsArr = json.optJSONArray("recommendedFramings") ?: JSONArray()
@@ -539,6 +539,35 @@ class GeminiInkReelService {
             Log.e(TAG, "synthesizeShotVoice failed", e)
             Result.failure(e)
         }
+    }
+
+    private fun callGeminiTextWithFallback(apiKey: String, requestBody: JSONObject): JSONObject {
+        val tried = linkedSetOf<String>()
+        val queue = ArrayDeque(listOf(TEXT_MODEL, "gemini-2.5-flash"))
+        var lastError: Exception? = null
+
+        while (queue.isNotEmpty()) {
+            val model = queue.removeFirst()
+            if (!tried.add(model)) continue
+            try {
+                return callGeminiRest(apiKey, model, requestBody)
+            } catch (e: Exception) {
+                lastError = e
+                val msg = e.message.orEmpty()
+                val isModelError = msg.contains("no longer available", ignoreCase = true) ||
+                    msg.contains("not found", ignoreCase = true) ||
+                    msg.contains("HTTP 404", ignoreCase = true) ||
+                    msg.contains("use models/", ignoreCase = true)
+                if (!isModelError) {
+                    throw e
+                }
+                val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)").find(msg)?.groupValues?.getOrNull(1)
+                if (!suggested.isNullOrBlank() && !tried.contains(suggested)) {
+                    queue.addFirst(suggested)
+                }
+            }
+        }
+        throw lastError ?: IllegalStateException("Gemini API request failed.")
     }
 
     private fun callGeminiRest(apiKey: String, model: String, requestBody: JSONObject): JSONObject {
@@ -784,7 +813,7 @@ class GeminiInkReelService {
 
     companion object {
         private const val TAG = "GeminiInkReelService"
-        private const val TEXT_MODEL = "gemini-2.5-flash"
+        private const val TEXT_MODEL = "gemini-3.8-flash"
         private const val TTS_MODEL = "gemini-2.5-flash-preview-tts"
     }
 }

@@ -343,7 +343,7 @@ object StickmanRenderer {
                 SpeakerSlot.B -> if (shot.framing == CameraFraming.SPLIT_PHONE_CALL) width * 0.74f else width * 0.66f
                 else -> width * 0.50f
             }
-            drawSpeechBubble(canvas, bubbleX, height * 0.26f, width, unit, shot.speechBubble, theme)
+            drawSpeechBubble(canvas, bubbleX, height * 0.16f, width, unit, shot.speechBubble, theme)
         }
 
         canvas.restore()
@@ -1280,7 +1280,7 @@ object StickmanRenderer {
         bannerText: String,
         theme: ReelColorTheme
     ) {
-        val rect = RectF(44f * unit, 36f * unit, w - 44f * unit, 96f * unit)
+        val rect = RectF(48f * unit, 24f * unit, w - 48f * unit, 76f * unit)
         val bannerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#EE09090B")
             style = Paint.Style.FILL
@@ -1290,13 +1290,13 @@ object StickmanRenderer {
             style = Paint.Style.STROKE
             strokeWidth = 3f * unit
         }
-        canvas.drawRoundRect(rect, 18f * unit, 18f * unit, bannerPaint)
-        canvas.drawRoundRect(rect, 18f * unit, 18f * unit, borderPaint)
+        canvas.drawRoundRect(rect, 16f * unit, 16f * unit, bannerPaint)
+        canvas.drawRoundRect(rect, 16f * unit, 16f * unit, borderPaint)
 
         textPaint.color = Color.WHITE
         textPaint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        textPaint.textSize = 26f * unit
-        canvas.drawText(bannerText.take(36), rect.centerX(), rect.centerY() + 9f * unit, textPaint)
+        textPaint.textSize = 24f * unit
+        canvas.drawText(bannerText.take(36), rect.centerX(), rect.centerY() + 8f * unit, textPaint)
     }
 
     private fun drawSpeedLines(canvas: Canvas, w: Float, h: Float, unit: Float, timeSec: Float) {
