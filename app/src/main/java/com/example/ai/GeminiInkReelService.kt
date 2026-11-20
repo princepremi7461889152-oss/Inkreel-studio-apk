@@ -39,6 +39,12 @@ data class SynthesizedAudioResult(
     val rawDurationMs: Long
 )
 
+data class GenerationOutcome<T>(
+    val data: T,
+    val usedFallback: Boolean = false,
+    val fallbackReason: String? = null
+)
+
 class GeminiInkReelService {
 
     suspend fun brainstormHooks(
@@ -46,7 +52,7 @@ class GeminiInkReelService {
         niche: String,
         twist: String,
         language: String
-    ): Result<List<String>> = withContext(Dispatchers.IO) {
+    ): Result<GenerationOutcome<List<String>>> = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) {
             return@withContext Result.failure(IllegalStateException("Please enter your Gemini API key first."))
         }
@@ -81,19 +87,29 @@ class GeminiInkReelService {
                 })
             }
 
-            val responseJson = withTimeout(60_000L) {
+            val responseJson = withTimeout(52_000L) {
                 callGeminiTextWithFallback(apiKey, body)
             }
             val text = extractTextFromResponse(responseJson)
             val parsed = JSONObject(text)
             val arr = parsed.getJSONArray("hooks")
             val list = (0 until arr.length()).map { arr.getString(it) }.filter { it.isNotBlank() }
-            Result.success(list.take(5))
+            Result.success(GenerationOutcome(list.take(5)))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "brainstormHooks failed", e)
-            Result.failure(e)
+            Log.w(TAG, "brainstormHooks Gemini unavailable, using instant hooks fallback", e)
+            if (isRecoverableBusyOrNetworkError(e)) {
+                Result.success(
+                    GenerationOutcome(
+                        data = buildOfflineHooks(niche, twist, language),
+                        usedFallback = true,
+                        fallbackReason = summarizeTransientReason(e)
+                    )
+                )
+            } else {
+                Result.failure(e)
+            }
         }
     }
 
@@ -105,7 +121,7 @@ class GeminiInkReelService {
         hook: String,
         clonedBlueprint: ClonedStyleBlueprint?,
         baseProject: ReelProject
-    ): Result<ReelProject> = withContext(Dispatchers.IO) {
+    ): Result<GenerationOutcome<ReelProject>> = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) {
             return@withContext Result.failure(IllegalStateException("Please enter your Gemini API key first."))
         }
@@ -124,7 +140,7 @@ class GeminiInkReelService {
             }
 
             val prompt = """
-                Create a complete 9:16 monochrome stickman comedy reel storyboard with 7 to 11 timed shots.
+                Create a complete 9:16 monochrome stickman comedy reel storyboard with 6 to 9 timed shots.
                 Niche: $niche
                 Comedy Twist Structure: $twist
                 Language: $language (if Hinglish, write punchy conversational Hinglish in Latin script; if Hindi, write natural Hindi).
@@ -150,7 +166,7 @@ class GeminiInkReelService {
                 })
             }
 
-            val responseJson = withTimeout(60_000L) {
+            val responseJson = withTimeout(52_000L) {
                 callGeminiTextWithFallback(apiKey, body)
             }
             val rawText = extractTextFromResponse(responseJson)
@@ -162,12 +178,30 @@ class GeminiInkReelService {
                 clonedSummary = clonedBlueprint?.summary.orEmpty(),
                 baseProject = baseProject
             )
-            Result.success(parsed)
+            Result.success(GenerationOutcome(parsed))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "generateStoryboardFromNiche failed", e)
-            Result.failure(e)
+            Log.w(TAG, "generateStoryboardFromNiche Gemini unavailable, using built-in comedy generator", e)
+            if (isRecoverableBusyOrNetworkError(e)) {
+                val fallbackProject = buildFallbackNicheStoryboard(
+                    niche = niche,
+                    twist = twist,
+                    language = language,
+                    hook = hook,
+                    clonedSummary = clonedBlueprint?.summary.orEmpty(),
+                    baseProject = baseProject
+                )
+                Result.success(
+                    GenerationOutcome(
+                        data = fallbackProject,
+                        usedFallback = true,
+                        fallbackReason = summarizeTransientReason(e)
+                    )
+                )
+            } else {
+                Result.failure(e)
+            }
         }
     }
 
@@ -526,8 +560,8 @@ class GeminiInkReelService {
                 })
             }
 
-            val responseJson = withTimeout(60_000L) {
-                callGeminiRest(apiKey, TTS_MODEL, body)
+            val responseJson = withTimeout(18_000L) {
+                callGeminiRest(apiKey, TTS_MODEL, body, readTimeoutMs = 16_000)
             }
             val b64 = extractAudioBase64FromResponse(responseJson)
             val pcm = Base64.decode(b64, Base64.DEFAULT)
@@ -541,27 +575,74 @@ class GeminiInkReelService {
         }
     }
 
+    private fun isRecoverableBusyOrNetworkError(e: Exception): Boolean {
+        val msg = e.message.orEmpty()
+        // Keep genuine invalid/empty API key errors explicit so user fixes typos
+        val isAuthFailure = msg.contains("API_KEY_INVALID", ignoreCase = true) ||
+            msg.contains("API key not valid", ignoreCase = true) ||
+            msg.contains("HTTP 400", ignoreCase = true) ||
+            msg.contains("HTTP 401", ignoreCase = true) ||
+            msg.contains("HTTP 403", ignoreCase = true)
+        return !isAuthFailure
+    }
+
+    private fun summarizeTransientReason(e: Exception): String {
+        val msg = e.message.orEmpty()
+        return when {
+            msg.contains("high demand", ignoreCase = true) || msg.contains("503") || msg.contains("overloaded", ignoreCase = true) ->
+                "Gemini servers busy (high demand)"
+            msg.contains("timeout", ignoreCase = true) ->
+                "Slow network timeout"
+            msg.contains("429") || msg.contains("quota", ignoreCase = true) ->
+                "Gemini rate limit reached"
+            else -> "Network busy"
+        }
+    }
+
+    private fun shouldTryNextModel(e: Exception): Boolean {
+        val msg = e.message.orEmpty()
+        return msg.contains("no longer available", ignoreCase = true) ||
+            msg.contains("not found", ignoreCase = true) ||
+            msg.contains("HTTP 404", ignoreCase = true) ||
+            msg.contains("use models/", ignoreCase = true) ||
+            msg.contains("high demand", ignoreCase = true) ||
+            msg.contains("overloaded", ignoreCase = true) ||
+            msg.contains("unavailable", ignoreCase = true) ||
+            msg.contains("timeout", ignoreCase = true) ||
+            msg.contains("HTTP 500", ignoreCase = true) ||
+            msg.contains("HTTP 502", ignoreCase = true) ||
+            msg.contains("HTTP 503", ignoreCase = true) ||
+            msg.contains("HTTP 504", ignoreCase = true) ||
+            msg.contains("HTTP 429", ignoreCase = true) ||
+            e is java.net.SocketTimeoutException
+    }
+
     private fun callGeminiTextWithFallback(apiKey: String, requestBody: JSONObject): JSONObject {
         val tried = linkedSetOf<String>()
-        val queue = ArrayDeque(listOf(TEXT_MODEL, "gemini-2.5-flash"))
+        val queue = ArrayDeque(
+            listOf(
+                preferredTextModel,
+                TEXT_MODEL,
+                "gemini-2.5-flash-lite",
+                "gemini-2.0-flash",
+                "gemini-2.5-flash"
+            )
+        )
         var lastError: Exception? = null
 
         while (queue.isNotEmpty()) {
             val model = queue.removeFirst()
             if (!tried.add(model)) continue
             try {
-                return callGeminiRest(apiKey, model, requestBody)
+                val res = callGeminiRest(apiKey, model, requestBody, readTimeoutMs = 20_000)
+                preferredTextModel = model
+                return res
             } catch (e: Exception) {
                 lastError = e
-                val msg = e.message.orEmpty()
-                val isModelError = msg.contains("no longer available", ignoreCase = true) ||
-                    msg.contains("not found", ignoreCase = true) ||
-                    msg.contains("HTTP 404", ignoreCase = true) ||
-                    msg.contains("use models/", ignoreCase = true)
-                if (!isModelError) {
+                if (!shouldTryNextModel(e)) {
                     throw e
                 }
-                val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)").find(msg)?.groupValues?.getOrNull(1)
+                val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)").find(e.message.orEmpty())?.groupValues?.getOrNull(1)
                 if (!suggested.isNullOrBlank() && !tried.contains(suggested)) {
                     queue.addFirst(suggested)
                 }
@@ -570,13 +651,18 @@ class GeminiInkReelService {
         throw lastError ?: IllegalStateException("Gemini API request failed.")
     }
 
-    private fun callGeminiRest(apiKey: String, model: String, requestBody: JSONObject): JSONObject {
+    private fun callGeminiRest(
+        apiKey: String,
+        model: String,
+        requestBody: JSONObject,
+        readTimeoutMs: Int = 24_000
+    ): JSONObject {
         val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=${apiKey.trim()}")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            connectTimeout = 20_000
-            readTimeout = 55_000
+            connectTimeout = 10_000
+            readTimeout = readTimeoutMs
             doOutput = true
         }
         return try {
@@ -606,9 +692,20 @@ class GeminiInkReelService {
             ?: throw IllegalStateException("No response candidates from Gemini.")
         for (i in 0 until parts.length()) {
             val txt = parts.optJSONObject(i)?.optString("text")
-            if (!txt.isNullOrBlank()) return txt
+            if (!txt.isNullOrBlank()) return stripJsonCodeFences(txt)
         }
         throw IllegalStateException("Gemini returned an empty text response.")
+    }
+
+    internal fun stripJsonCodeFences(raw: String): String {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("```")) return trimmed
+        return trimmed
+            .removePrefix("```json")
+            .removePrefix("```JSON")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
     }
 
     private fun extractAudioBase64FromResponse(response: JSONObject): String {
@@ -811,9 +908,289 @@ class GeminiInkReelService {
         return Bitmap.createScaledBitmap(source, newW, newH, true)
     }
 
+    fun buildOfflineHooks(niche: String, twist: String, language: String): List<String> {
+        val isHinglish = language.equals("Hinglish", ignoreCase = true) || language.equals("Hindi", ignoreCase = true)
+        return if (isHinglish) {
+            listOf(
+                "$niche mein jab sab normal lag raha ho, achanak sabse bada twist nikal aata hai ($twist)!",
+                "Sir ne poocha excuse kya hai — aur jawab sunke poora room silent ho gaya!",
+                "Chai pee kar plan banaya tha topper banne ka, par Wifi band hote hi sab gadbad ho gayi!",
+                "Dost bola tension mat le main sambhal lunga — aur 5 minute baad khud bhaag gaya!",
+                "Pehle laga free ka offer hai, par end mein bill double nikla!"
+            )
+        } else {
+            listOf(
+                "Everyone in $niche thought it was under control — until the $twist hit!",
+                "He walked in confident with a fake plan... and accidentally confessed on speakerphone!",
+                "She promised 5 minutes of work, took a 3-hour chai break, and still got promoted!",
+                "The strict boss demanded proof — so the intern brought the actual receipt!",
+                "One innocent excuse turned into a full courtroom chase in 10 seconds!"
+            )
+        }
+    }
+
+    fun buildFallbackNicheStoryboard(
+        niche: String,
+        twist: String,
+        language: String,
+        hook: String,
+        clonedSummary: String,
+        baseProject: ReelProject
+    ): ReelProject {
+        val lower = niche.lowercase()
+        val isHinglish = language.equals("Hinglish", ignoreCase = true) || language.equals("Hindi", ignoreCase = true)
+
+        val room = when {
+            lower.contains("office") || lower.contains("corporate") -> RoomSetting.OFFICE
+            lower.contains("doctor") || lower.contains("hospital") -> RoomSetting.HOSPITAL
+            lower.contains("interview") -> RoomSetting.INTERVIEW_ROOM
+            lower.contains("gym") -> RoomSetting.GYM
+            lower.contains("cafe") || lower.contains("coffee") -> RoomSetting.COFFEE_SHOP
+            lower.contains("kitchen") || lower.contains("chai") || lower.contains("cook") -> RoomSetting.KITCHEN
+            lower.contains("cricket") || lower.contains("sport") || lower.contains("street") -> RoomSetting.STREET_PARK
+            lower.contains("gaming") || lower.contains("reel") -> RoomSetting.GAMING_ROOM
+            lower.contains("parent") || lower.contains("hostel") || lower.contains("wedding") || lower.contains("dance") -> RoomSetting.LIVING_ROOM
+            else -> RoomSetting.CLASSROOM
+        }
+
+        val bgm = when {
+            lower.contains("cricket") || lower.contains("gym") || lower.contains("dance") -> BgmMood.CHAOTIC_CHASE
+            lower.contains("interview") || lower.contains("doctor") -> BgmMood.DRAMATIC_SUSPENSE
+            else -> BgmMood.QUIRKY_COMEDY
+        }
+
+        val cast = when (room) {
+            RoomSetting.OFFICE -> listOf(
+                CharacterProfile(SpeakerSlot.A, "Rohan Sir", "Manager", CharacterGender.MALE, "Orus", 1.0f, HairStyle.PARTED, true, FacialHair.MUSTACHE, CharacterProp.FOLDER),
+                CharacterProfile(SpeakerSlot.B, "Neha", "Clever Dev", CharacterGender.FEMALE, "Leda", 1.05f, HairStyle.PONYTAIL, false, FacialHair.NONE, CharacterProp.MUG),
+                CharacterProfile(SpeakerSlot.C, "Kavita Ma'am", "Director", CharacterGender.FEMALE, "Kore", 1.0f, HairStyle.BUN, true, FacialHair.NONE, CharacterProp.CLIPBOARD)
+            )
+            RoomSetting.GYM -> listOf(
+                CharacterProfile(SpeakerSlot.A, "Coach Kabir", "Trainer", CharacterGender.MALE, "Fenrir", 1.0f, HairStyle.SPIKY, false, FacialHair.GOATEE, CharacterProp.DUMBBELL),
+                CharacterProfile(SpeakerSlot.B, "Riya", "Cardio Pro", CharacterGender.FEMALE, "Zephyr", 1.04f, HairStyle.PONYTAIL, false, FacialHair.NONE, CharacterProp.PHONE),
+                CharacterProfile(SpeakerSlot.C, "Aunty Ji", "Surprise Guest", CharacterGender.FEMALE, "Sulafat", 1.0f, HairStyle.BUN, true, FacialHair.NONE, CharacterProp.MUG)
+            )
+            RoomSetting.KITCHEN -> listOf(
+                CharacterProfile(SpeakerSlot.A, "Mummy", "Head Chef", CharacterGender.FEMALE, "Kore", 1.0f, HairStyle.BUN, true, FacialHair.NONE, CharacterProp.CLIPBOARD),
+                CharacterProfile(SpeakerSlot.B, "Aryan", "Chai Master", CharacterGender.MALE, "Puck", 1.05f, HairStyle.MESSY, false, FacialHair.NONE, CharacterProp.MUG),
+                CharacterProfile(SpeakerSlot.C, "Didi", "Food Critic", CharacterGender.FEMALE, "Aoede", 1.0f, HairStyle.LONG_WAVY, false, FacialHair.NONE, CharacterProp.PHONE)
+            )
+            RoomSetting.GAMING_ROOM -> listOf(
+                CharacterProfile(SpeakerSlot.A, "Papa", "Wifi Boss", CharacterGender.MALE, "Orus", 1.0f, HairStyle.PARTED, true, FacialHair.MUSTACHE, CharacterProp.RULER),
+                CharacterProfile(SpeakerSlot.B, "Ananya", "Pro Gamer", CharacterGender.FEMALE, "Leda", 1.05f, HairStyle.TWIN_BRAIDS, false, FacialHair.NONE, CharacterProp.PHONE),
+                CharacterProfile(SpeakerSlot.C, "Chintu", "Sidekick", CharacterGender.MALE, "Puck", 1.06f, HairStyle.SPIKY, false, FacialHair.NONE, CharacterProp.PHONE)
+            )
+            RoomSetting.STREET_PARK -> listOf(
+                CharacterProfile(SpeakerSlot.A, "Captain Vikram", "Bowler", CharacterGender.MALE, "Orus", 1.0f, HairStyle.SPIKY, false, FacialHair.BEARD, CharacterProp.NONE),
+                CharacterProfile(SpeakerSlot.B, "Tara", "Power Hitter", CharacterGender.FEMALE, "Zephyr", 1.04f, HairStyle.PONYTAIL, false, FacialHair.NONE, CharacterProp.NONE),
+                CharacterProfile(SpeakerSlot.C, "Umpire Uncle", "Neighbor", CharacterGender.MALE, "Charon", 0.96f, HairStyle.BALD, true, FacialHair.MUSTACHE, CharacterProp.CLIPBOARD)
+            )
+            else -> ReelProject.defaultCast()
+        }
+
+        val activityA = when (room) {
+            RoomSetting.GYM -> CharacterActivity.GYM_WORKOUT
+            RoomSetting.KITCHEN -> CharacterActivity.COOKING_CHAI
+            RoomSetting.STREET_PARK -> CharacterActivity.PLAYING_CRICKET
+            RoomSetting.GAMING_ROOM -> CharacterActivity.GAMING_PHONE
+            else -> CharacterActivity.WALKING_IN
+        }
+        val activityB = when (room) {
+            RoomSetting.GYM -> CharacterActivity.TAKING_SELFIE
+            RoomSetting.KITCHEN -> CharacterActivity.COOKING_CHAI
+            RoomSetting.STREET_PARK -> CharacterActivity.DANCING
+            RoomSetting.GAMING_ROOM -> CharacterActivity.GAMING_PHONE
+            else -> CharacterActivity.STUDYING_WRITING
+        }
+
+        val hookShort = hook.trim().take(70)
+        val shots = if (isHinglish) {
+            listOf(
+                ReelShot(
+                    shotId = "fb_1_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.A,
+                    framing = CameraFraming.WIDE_DOORWAY,
+                    dialogue = if (hookShort.isNotBlank()) hookShort else "Arre aaj $niche mein sab kuch time par chahiye, samjhe?!",
+                    speechBubble = "TIME PAR!",
+                    moodPose = MoodPose.ANGRY,
+                    activity = activityA,
+                    sfx = ComicSfx.DOOR_SLAM,
+                    durationMs = 2800L
+                ),
+                ReelShot(
+                    shotId = "fb_2_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.B,
+                    framing = CameraFraming.CLOSE_UP_B,
+                    dialogue = "Haan bilkul! Maine subah 5 baje se full planning aur practice shuru kar di thi.",
+                    speechBubble = "FULL READY!",
+                    moodPose = MoodPose.SMUG,
+                    activity = activityB,
+                    sfx = ComicSfx.NONE,
+                    durationMs = 2900L
+                ),
+                ReelShot(
+                    shotId = "fb_3_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.A,
+                    framing = CameraFraming.DESK_SLAM,
+                    dialogue = "Jhooth mat bolo! Tum abhi tak reel scroll aur chai peene mein busy the!",
+                    speechBubble = "PAKDE GAYE!",
+                    moodPose = MoodPose.FURIOUS,
+                    activity = CharacterActivity.CRYING_DRAMA,
+                    sfx = ComicSfx.DESK_SLAM,
+                    durationMs = 2800L
+                ),
+                ReelShot(
+                    shotId = "fb_4_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.SILENT,
+                    framing = CameraFraming.TIME_SKIP_CARD,
+                    dialogue = "",
+                    transitionCard = "10 MINUTES LATER",
+                    moodPose = MoodPose.NEUTRAL,
+                    sfx = ComicSfx.TIME_SKIP_WHOOSH,
+                    durationMs = 1400L
+                ),
+                ReelShot(
+                    shotId = "fb_5_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.B,
+                    framing = CameraFraming.SPLIT_PHONE_CALL,
+                    dialogue = "Suno, twist ye hai ki client ko mera reel wala idea hi pasand aa gaya!",
+                    speechBubble = "VIRAL TWIST!",
+                    moodPose = MoodPose.SMUG,
+                    activity = CharacterActivity.CLAPPING_CHEERING,
+                    sticker = MemeSticker.DEAL_WITH_IT_SHADES,
+                    sfx = ComicSfx.DRAMATIC_STING,
+                    durationMs = 3100L
+                ),
+                ReelShot(
+                    shotId = "fb_6_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.C,
+                    framing = CameraFraming.CLOSE_UP_C,
+                    dialogue = "Bilkul sahi! Promotion aur treat dono pakki — ab party shuru karo!",
+                    speechBubble = "WAIT WHAT?!",
+                    moodPose = MoodPose.SHOCKED,
+                    activity = CharacterActivity.DANCING,
+                    sticker = MemeSticker.MIND_BLOWN,
+                    sfx = ComicSfx.PUNCHLINE_BOOM,
+                    durationMs = 2900L
+                ),
+                ReelShot(
+                    shotId = "fb_7_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.A,
+                    framing = CameraFraming.SLAPSTICK_CHASE,
+                    dialogue = "Ruko! Mera credit wapas do, selfie baad mein lena!",
+                    speechBubble = "BHAAGO!!",
+                    moodPose = MoodPose.FURIOUS,
+                    activity = CharacterActivity.WALKING_IN,
+                    sfx = ComicSfx.CARTOON_RUN,
+                    durationMs = 2400L
+                )
+            )
+        } else {
+            listOf(
+                ReelShot(
+                    shotId = "fb_1_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.A,
+                    framing = CameraFraming.WIDE_DOORWAY,
+                    dialogue = if (hookShort.isNotBlank()) hookShort else "Listen up! Today in $niche, zero excuses and full discipline!",
+                    speechBubble = "NO EXCUSES!",
+                    moodPose = MoodPose.ANGRY,
+                    activity = activityA,
+                    sfx = ComicSfx.DOOR_SLAM,
+                    durationMs = 2800L
+                ),
+                ReelShot(
+                    shotId = "fb_2_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.B,
+                    framing = CameraFraming.CLOSE_UP_B,
+                    dialogue = "Relax! I stayed up all night perfecting my strategy for this exact moment.",
+                    speechBubble = "TRUST ME!",
+                    moodPose = MoodPose.SMUG,
+                    activity = activityB,
+                    sfx = ComicSfx.NONE,
+                    durationMs = 2900L
+                ),
+                ReelShot(
+                    shotId = "fb_3_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.A,
+                    framing = CameraFraming.DESK_SLAM,
+                    dialogue = "You literally forgot to save the file AND drank three coffees instead!",
+                    speechBubble = "CAUGHT RED!",
+                    moodPose = MoodPose.FURIOUS,
+                    activity = CharacterActivity.CRYING_DRAMA,
+                    sfx = ComicSfx.DESK_SLAM,
+                    durationMs = 2800L
+                ),
+                ReelShot(
+                    shotId = "fb_4_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.SILENT,
+                    framing = CameraFraming.TIME_SKIP_CARD,
+                    dialogue = "",
+                    transitionCard = "10 MINUTES LATER",
+                    moodPose = MoodPose.NEUTRAL,
+                    sfx = ComicSfx.TIME_SKIP_WHOOSH,
+                    durationMs = 1400L
+                ),
+                ReelShot(
+                    shotId = "fb_5_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.B,
+                    framing = CameraFraming.SPLIT_PHONE_CALL,
+                    dialogue = "Plot twist! The camera was recording the whole chaos and it just hit a million views!",
+                    speechBubble = "1M VIEWS!",
+                    moodPose = MoodPose.SMUG,
+                    activity = CharacterActivity.CLAPPING_CHEERING,
+                    sticker = MemeSticker.DEAL_WITH_IT_SHADES,
+                    sfx = ComicSfx.DRAMATIC_STING,
+                    durationMs = 3100L
+                ),
+                ReelShot(
+                    shotId = "fb_6_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.C,
+                    framing = CameraFraming.CLOSE_UP_C,
+                    dialogue = "Genius! Give them an instant bonus and make a Part 2 immediately!",
+                    speechBubble = "PROMOTED?!",
+                    moodPose = MoodPose.SHOCKED,
+                    activity = CharacterActivity.DANCING,
+                    sticker = MemeSticker.MIND_BLOWN,
+                    sfx = ComicSfx.PUNCHLINE_BOOM,
+                    durationMs = 2900L
+                ),
+                ReelShot(
+                    shotId = "fb_7_${UUID.randomUUID().toString().take(4)}",
+                    speaker = SpeakerSlot.A,
+                    framing = CameraFraming.SLAPSTICK_CHASE,
+                    dialogue = "Wait! At least share half the viral royalty with me!",
+                    speechBubble = "COME BACK!",
+                    moodPose = MoodPose.FURIOUS,
+                    activity = CharacterActivity.WALKING_IN,
+                    sfx = ComicSfx.CARTOON_RUN,
+                    durationMs = 2400L
+                )
+            )
+        }
+
+        return baseProject.copy(
+            id = "",
+            title = "$niche Chaos",
+            socialCaption = if (isHinglish) "$niche ka sabse bada comedy twist! End tak dekho!" else "Wait for the twist in this $niche skit!",
+            hashtags = listOf("#stickman", "#comedyreels", "#inkreel", "#viral"),
+            niche = niche,
+            twistStructure = twist,
+            language = language,
+            setting = room,
+            bgmMood = bgm,
+            clonedStyleSummary = clonedSummary,
+            characters = cast,
+            shots = shots,
+            createdAtMs = System.currentTimeMillis(),
+            updatedAtMs = System.currentTimeMillis()
+        )
+    }
+
     companion object {
         private const val TAG = "GeminiInkReelService"
         private const val TEXT_MODEL = "gemini-3.8-flash"
         private const val TTS_MODEL = "gemini-2.5-flash-preview-tts"
+        @Volatile
+        private var preferredTextModel = TEXT_MODEL
     }
 }

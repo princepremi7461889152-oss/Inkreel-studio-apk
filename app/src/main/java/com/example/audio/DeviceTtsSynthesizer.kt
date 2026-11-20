@@ -17,6 +17,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Normalizes Romanized Hinglish words into clearer phonetic forms for Android TTS engines
@@ -76,18 +77,41 @@ object HinglishPhoneticTuner {
  * file and converts it into 24kHz 16-bit mono PCM bytes so stickman models always speak with
  * real voice + lip sync even offline or before Gemini TTS is run.
  */
-class DeviceTtsSynthesizer(context: Context) {
+class DeviceTtsSynthesizer(
+    context: Context,
+    private val initTimeoutMs: Long = 3_500L,
+    private val synthTimeoutMs: Long = 7_000L
+) {
 
     private val appContext = context.applicationContext
     private val synthMutex = Mutex()
+    private val cachedVoices = ConcurrentHashMap<String, android.speech.tts.Voice>()
+    @Volatile
+    private var voicesScanned = false
+    @Volatile
+    private var retryInitAfterMs = 0L
     private var tts: TextToSpeech? = null
     private var initDeferred: CompletableDeferred<Boolean>? = null
+
+    suspend fun warmUp() {
+        runCatching {
+            synthMutex.withLock {
+                ensureInitialized()
+            }
+        }
+    }
 
     private suspend fun ensureInitialized(): TextToSpeech? {
         val existing = tts
         val existingInit = initDeferred
         if (existing != null && existingInit != null && existingInit.isCompleted) {
             return if (existingInit.await()) existing else null
+        }
+
+        // Avoid repeating multi-second hangs across 7+ shots when the device TTS engine is missing/broken
+        val nowMs = System.currentTimeMillis()
+        if (nowMs < retryInitAfterMs) {
+            return null
         }
 
         val deferred = CompletableDeferred<Boolean>()
@@ -99,8 +123,104 @@ class DeviceTtsSynthesizer(context: Context) {
             }
         }
         tts = instance
-        val ok = withTimeoutOrNull(8_000L) { deferred.await() } ?: false
-        return if (ok) instance else null
+        val ok = withTimeoutOrNull(initTimeoutMs) { deferred.await() } ?: false
+        if (!ok) {
+            retryInitAfterMs = System.currentTimeMillis() + 60_000L
+            tts = null
+            initDeferred = null
+            runCatching { instance.shutdown() }
+            return null
+        }
+        retryInitAfterMs = 0L
+        return instance
+    }
+
+    private fun isVoiceInstalledAndOffline(v: android.speech.tts.Voice): Boolean {
+        if (v.isNetworkConnectionRequired) return false
+        val features = v.features.orEmpty()
+        if (features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) ||
+            features.any { it.equals("notInstalled", ignoreCase = true) }
+        ) {
+            return false
+        }
+        return true
+    }
+
+    private fun resolveVoiceFor(
+        engine: TextToSpeech,
+        targetLocale: Locale,
+        gender: CharacterGender
+    ): android.speech.tts.Voice? {
+        val key = "${targetLocale.language}_${gender.name}"
+        cachedVoices[key]?.let { return it }
+        if (!voicesScanned) {
+            voicesScanned = true
+            runCatching {
+                val voices = engine.voices.orEmpty().filter { isVoiceInstalledAndOffline(it) }
+                for (lang in listOf("hi", "en")) {
+                    for (g in CharacterGender.entries) {
+                        val wantFemale = g == CharacterGender.FEMALE
+                        val match = voices.firstOrNull { v ->
+                            val nameLower = v.name.lowercase()
+                            val matchesLang = v.locale.language == lang
+                            val looksFemale = nameLower.contains("female") ||
+                                nameLower.contains("-f-") ||
+                                nameLower.endsWith("-f") ||
+                                nameLower.contains("sfg") ||
+                                nameLower.contains("tpf") ||
+                                nameLower.contains("iob")
+                            val looksMale = nameLower.contains("male") ||
+                                nameLower.contains("-m-") ||
+                                nameLower.endsWith("-m") ||
+                                nameLower.contains("iol") ||
+                                nameLower.contains("iom")
+                            matchesLang && ((wantFemale && looksFemale) || (!wantFemale && looksMale))
+                        }
+                        if (match != null) {
+                            cachedVoices["${lang}_${g.name}"] = match
+                        }
+                    }
+                }
+            }
+        }
+        return cachedVoices[key]
+    }
+
+    private data class WavAttempt(val bytes: ByteArray?, val timedOut: Boolean)
+
+    private suspend fun synthesizeToWavBytesOnce(
+        engine: TextToSpeech,
+        spokenText: String,
+        outFile: File
+    ): WavAttempt {
+        if (outFile.exists()) outFile.delete()
+        val utteranceId = "utt_${UUID.randomUUID()}"
+        val done = CompletableDeferred<Boolean>()
+        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(id: String?) {}
+            override fun onDone(id: String?) {
+                if (id == utteranceId) done.complete(true)
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onError(id: String?) {
+                if (id == utteranceId) done.complete(false)
+            }
+
+            override fun onError(id: String?, errorCode: Int) {
+                if (id == utteranceId) done.complete(false)
+            }
+        })
+
+        val res = engine.synthesizeToFile(spokenText, Bundle(), outFile, utteranceId)
+        if (res != TextToSpeech.SUCCESS) return WavAttempt(null, timedOut = false)
+        val ok = withTimeoutOrNull(synthTimeoutMs) { done.await() }
+        if (ok == null) {
+            // Do not wait another full synthTimeoutMs on retry if the OS TTS callback hung
+            return WavAttempt(null, timedOut = true)
+        }
+        if (!ok || !outFile.exists() || outFile.length() < 64L) return WavAttempt(null, timedOut = false)
+        return WavAttempt(outFile.readBytes(), timedOut = false)
     }
 
     suspend fun synthesizeShotVoice(
@@ -109,108 +229,88 @@ class DeviceTtsSynthesizer(context: Context) {
         gender: CharacterGender,
         language: String,
         moodPose: MoodPose
-    ): Result<SynthesizedAudioResult> = synthMutex.withLock {
-        withContext(Dispatchers.IO) {
-            val spokenText = HinglishPhoneticTuner.tune(dialogue, phoneticHint, language)
-            if (spokenText.isBlank()) {
-                return@withContext Result.failure(IllegalArgumentException("Dialogue is empty."))
+    ): Result<SynthesizedAudioResult> {
+        val spokenText = HinglishPhoneticTuner.tune(dialogue, phoneticHint, language)
+        if (spokenText.isBlank()) {
+            return Result.failure(IllegalArgumentException("Dialogue is empty."))
+        }
+
+        // Hold lock only while Android TextToSpeech synthesizes the WAV file;
+        // release immediately so resampling runs concurrently with the next shot.
+        val wavBytes: ByteArray = synthMutex.withLock {
+            withContext(Dispatchers.IO) {
+                val engine = ensureInitialized()
+                    ?: return@withContext Result.failure<ByteArray>(IllegalStateException("Device TextToSpeech engine unavailable."))
+
+                val outFile = File(appContext.cacheDir, "tts_${UUID.randomUUID()}.wav")
+                try {
+                    val requestedLocale = when {
+                        language.equals("Hindi", ignoreCase = true) -> Locale("hi", "IN")
+                        language.equals("Hinglish", ignoreCase = true) -> Locale("en", "IN")
+                        else -> Locale.US
+                    }
+                    val langStatus = engine.setLanguage(requestedLocale)
+                    val activeLocale = if (langStatus == TextToSpeech.LANG_MISSING_DATA || langStatus == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        engine.setLanguage(Locale.US)
+                        Locale.US
+                    } else {
+                        requestedLocale
+                    }
+
+                    resolveVoiceFor(engine, activeLocale, gender)?.let { matched ->
+                        runCatching { engine.voice = matched }
+                    }
+
+                    // Pitch & rate tuned for Male vs Female & comedy emotion
+                    val basePitch = if (gender == CharacterGender.FEMALE) 1.24f else 0.92f
+                    val moodPitchBoost = when (moodPose) {
+                        MoodPose.SHOCKED, MoodPose.FURIOUS -> 0.08f
+                        MoodPose.DEADPAN -> -0.06f
+                        else -> 0f
+                    }
+                    engine.setPitch((basePitch + moodPitchBoost).coerceIn(0.65f, 1.55f))
+
+                    val rate = when (moodPose) {
+                        MoodPose.NERVOUS, MoodPose.SWEATING, MoodPose.FURIOUS -> 1.10f
+                        MoodPose.DEADPAN -> 0.93f
+                        else -> 1.0f
+                    }
+                    engine.setSpeechRate(rate)
+
+                    var attempt = synthesizeToWavBytesOnce(engine, spokenText, outFile)
+
+                    // Retry once with default Locale.US voice if an OEM/uninstalled voice produced empty audio promptly
+                    if (attempt.bytes == null && !attempt.timedOut) {
+                        runCatching {
+                            engine.setLanguage(Locale.US)
+                            engine.defaultVoice?.let { def -> engine.voice = def }
+                        }
+                        attempt = synthesizeToWavBytesOnce(engine, spokenText, outFile)
+                    }
+
+                    if (attempt.timedOut) {
+                        retryInitAfterMs = System.currentTimeMillis() + 60_000L
+                    }
+
+                    val bytes = attempt.bytes
+                        ?: return@withContext Result.failure<ByteArray>(IllegalStateException("Device TTS generated empty audio."))
+                    Result.success(bytes)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Device TTS synthesis failed", e)
+                    Result.failure<ByteArray>(e)
+                } finally {
+                    runCatching { if (outFile.exists()) outFile.delete() }
+                }
             }
-            val engine = ensureInitialized()
-                ?: return@withContext Result.failure(IllegalStateException("Device TextToSpeech engine unavailable."))
+        }.getOrElse { return Result.failure(it) }
 
-            val outFile = File(appContext.cacheDir, "tts_${UUID.randomUUID()}.wav")
-            try {
-                val targetLocale = when {
-                    language.equals("Hindi", ignoreCase = true) -> Locale("hi", "IN")
-                    language.equals("Hinglish", ignoreCase = true) -> Locale("en", "IN")
-                    else -> Locale.US
-                }
-                val langStatus = engine.setLanguage(targetLocale)
-                if (langStatus == TextToSpeech.LANG_MISSING_DATA || langStatus == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    engine.setLanguage(Locale.US)
-                }
-
-                // Select a device voice matching gender + language if available
-                runCatching {
-                    val voices = engine.voices.orEmpty()
-                    val wantFemale = gender == CharacterGender.FEMALE
-                    val matched = voices.firstOrNull { v ->
-                        val nameLower = v.name.lowercase()
-                        val matchesLang = v.locale.language == targetLocale.language
-                        val looksFemale = nameLower.contains("female") ||
-                            nameLower.contains("-f-") ||
-                            nameLower.endsWith("-f") ||
-                            nameLower.contains("sfg") ||
-                            nameLower.contains("tpf") ||
-                            nameLower.contains("iob")
-                        val looksMale = nameLower.contains("male") ||
-                            nameLower.contains("-m-") ||
-                            nameLower.endsWith("-m") ||
-                            nameLower.contains("iol") ||
-                            nameLower.contains("iom")
-                        matchesLang && !v.isNetworkConnectionRequired && ((wantFemale && looksFemale) || (!wantFemale && looksMale))
-                    }
-                    if (matched != null) {
-                        engine.voice = matched
-                    }
-                }
-
-                // Pitch & rate tuned for Male vs Female & comedy emotion
-                val basePitch = if (gender == CharacterGender.FEMALE) 1.24f else 0.92f
-                val moodPitchBoost = when (moodPose) {
-                    MoodPose.SHOCKED, MoodPose.FURIOUS -> 0.08f
-                    MoodPose.DEADPAN -> -0.06f
-                    else -> 0f
-                }
-                engine.setPitch((basePitch + moodPitchBoost).coerceIn(0.65f, 1.55f))
-
-                val rate = when (moodPose) {
-                    MoodPose.NERVOUS, MoodPose.SWEATING, MoodPose.FURIOUS -> 1.10f
-                    MoodPose.DEADPAN -> 0.93f
-                    else -> 1.0f
-                }
-                engine.setSpeechRate(rate)
-
-                val utteranceId = "utt_${UUID.randomUUID()}"
-                val done = CompletableDeferred<Boolean>()
-                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {}
-                    override fun onDone(id: String?) {
-                        if (id == utteranceId) done.complete(true)
-                    }
-
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(id: String?) {
-                        if (id == utteranceId) done.complete(false)
-                    }
-
-                    override fun onError(id: String?, errorCode: Int) {
-                        if (id == utteranceId) done.complete(false)
-                    }
-                })
-
-                val res = engine.synthesizeToFile(spokenText, Bundle(), outFile, utteranceId)
-                if (res != TextToSpeech.SUCCESS) {
-                    return@withContext Result.failure(IllegalStateException("TTS synthesizeToFile failed ($res)."))
-                }
-
-                val ok = withTimeoutOrNull(20_000L) { done.await() } ?: false
-                if (!ok || !outFile.exists() || outFile.length() < 64L) {
-                    return@withContext Result.failure(IllegalStateException("Device TTS generated empty audio."))
-                }
-
-                val wavBytes = outFile.readBytes()
-                val pcm24k = decodeWavTo24kMonoPcm(wavBytes)
-                if (pcm24k.size < 200) {
-                    return@withContext Result.failure(IllegalStateException("Decoded TTS audio was empty."))
-                }
+        return withContext(Dispatchers.Default) {
+            val pcm24k = decodeWavTo24kMonoPcm(wavBytes)
+            if (pcm24k.size < 200) {
+                Result.failure(IllegalStateException("Decoded TTS audio was empty."))
+            } else {
                 val rawDurationMs = ((pcm24k.size.toDouble() / 48000.0) * 1000.0).toLong().coerceAtLeast(700L)
                 Result.success(SynthesizedAudioResult(pcmBytes = pcm24k, rawDurationMs = rawDurationMs))
-            } catch (e: Exception) {
-                Log.w(TAG, "Device TTS synthesis failed", e)
-                Result.failure(e)
-            } finally {
-                runCatching { if (outFile.exists()) outFile.delete() }
             }
         }
     }
@@ -222,6 +322,8 @@ class DeviceTtsSynthesizer(context: Context) {
         }
         tts = null
         initDeferred = null
+        cachedVoices.clear()
+        voicesScanned = false
     }
 
     private fun decodeWavTo24kMonoPcm(wav: ByteArray): ByteArray {
@@ -236,6 +338,7 @@ class DeviceTtsSynthesizer(context: Context) {
         while (pos + 8 <= wav.size) {
             val chunkId = String(wav, pos, 4, Charsets.US_ASCII)
             val chunkLen = readIntLe(wav, pos + 4)
+            if (chunkLen < 0) break
             val bodyStart = pos + 8
             if (chunkId == "fmt " && bodyStart + 16 <= wav.size) {
                 channels = readShortLe(wav, bodyStart + 2).coerceAtLeast(1)

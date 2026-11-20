@@ -7,8 +7,11 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.util.Log
+import com.example.ai.SynthesizedAudioResult
 import com.example.model.BgmMood
+import com.example.model.CharacterGender
 import com.example.model.ComicSfx
+import com.example.model.MoodPose
 import com.example.model.ReelProject
 import com.example.model.SpeakerSlot
 import kotlinx.coroutines.CoroutineScope
@@ -235,6 +238,70 @@ object ProceduralAudioEngine {
             x < -0.95f -> -0.95f - 0.05f * ((-x - 0.95f) / (1f + (-x - 0.95f)))
             else -> x
         }
+    }
+
+    /**
+     * Last-resort expressive cartoon speech synthesizer at 24kHz 16-bit mono PCM when both
+     * cloud TTS and device TextToSpeech engines return empty audio or lack offline language packs.
+     * Shapes syllable pulses with vowel formants, pitch inflection, and mood pacing.
+     */
+    fun synthesizeCartoonVoiceFallback(
+        text: String,
+        gender: CharacterGender,
+        moodPose: MoodPose
+    ): SynthesizedAudioResult {
+        val words = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        val durationMs = ((words.size.coerceAtLeast(1) * 320L) + 450L).coerceIn(1100L, 12000L)
+        val totalSamples = ((durationMs / 1000.0) * SAMPLE_RATE).toInt().coerceAtLeast(SAMPLE_RATE)
+        val out = ByteArray(totalSamples * 2)
+
+        val baseFreq = if (gender == CharacterGender.FEMALE) 235.0 else 132.0
+        val moodBoost = when (moodPose) {
+            MoodPose.SHOCKED, MoodPose.FURIOUS, MoodPose.ANGRY -> 1.12
+            MoodPose.DEADPAN -> 0.90
+            else -> 1.0
+        }
+        val syllableRateHz = when (moodPose) {
+            MoodPose.NERVOUS, MoodPose.SWEATING, MoodPose.FURIOUS -> 6.8
+            MoodPose.DEADPAN -> 4.2
+            else -> 5.4
+        }
+
+        val rng = Random(text.hashCode())
+        var phase1 = 0.0
+        var phase2 = 0.0
+        val fadeSamples = (0.04 * SAMPLE_RATE).toInt().coerceAtLeast(1)
+
+        for (i in 0 until totalSamples) {
+            val t = i.toDouble() / SAMPLE_RATE
+            val syllPhase = (t * syllableRateHz) % 1.0
+            val syllIndex = (t * syllableRateHz).toInt()
+            // Brief consonant pauses between words/syllables give crisp lip-sync modulation
+            val isPause = ((syllIndex % 5) == 4 && syllPhase > 0.55)
+            val env = if (isPause) {
+                0.04
+            } else {
+                sin(PI * syllPhase).coerceAtLeast(0.0)
+            }
+            val inflection = 1.0 + 0.14 * sin(t * 7.5 + (syllIndex % 3))
+            val f0 = baseFreq * moodBoost * inflection
+            phase1 += 2.0 * PI * f0 / SAMPLE_RATE
+            phase2 += 2.0 * PI * (f0 * 2.25) / SAMPLE_RATE
+
+            val vocal = (sin(phase1) * 0.58 + sin(phase2) * 0.24 + sin(phase1 * 3.0) * 0.12)
+            val breath = (rng.nextDouble() * 2.0 - 1.0) * 0.04
+            val edgeGain = when {
+                i < fadeSamples -> i.toDouble() / fadeSamples
+                i > totalSamples - fadeSamples -> (totalSamples - i).toDouble() / fadeSamples
+                else -> 1.0
+            }
+            val sample = ((vocal + breath) * env * edgeGain * 0.62).toFloat().coerceIn(-1f, 1f)
+            val pcm = (sample * 32767f).toInt().coerceIn(-32768, 32767)
+            out[i * 2] = (pcm and 0xFF).toByte()
+            out[i * 2 + 1] = ((pcm shr 8) and 0xFF).toByte()
+        }
+
+        return SynthesizedAudioResult(pcmBytes = out, rawDurationMs = durationMs)
     }
 
     private inline fun genSamples(durationSec: Float, fn: (t: Double, rng: Random) -> Float): FloatArray {

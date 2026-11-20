@@ -56,9 +56,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.canvas.StickmanRenderer
@@ -99,14 +101,19 @@ fun CenterStagePanel(
         shape = MaterialTheme.shapes.large
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            val stageMaxWidth = if (maxWidth < 460.dp) 200.dp else 268.dp
+            val isCompactViewport = maxWidth < 460.dp
+            val stageMaxWidth = when {
+                isCompactViewport && maxHeight < 580.dp -> 156.dp
+                isCompactViewport -> 182.dp
+                else -> 268.dp
+            }
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
-                    .padding(14.dp),
+                    .padding(if (isCompactViewport) 10.dp else 14.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(if (isCompactViewport) 8.dp else 10.dp)
             ) {
             // Stage Header + Reference Switcher
             Row(
@@ -183,6 +190,7 @@ fun CenterStagePanel(
                         Canvas(
                             modifier = Modifier
                                 .fillMaxSize()
+                                .clipToBounds()
                                 .testTag("stage_canvas")
                         ) {
                             drawIntoCanvas { c ->
@@ -260,7 +268,10 @@ fun CenterStagePanel(
                                 Text(
                                     text = "Rendering MP4 Video... ${(state.exportProgress * 100).toInt()}%",
                                     style = MaterialTheme.typography.titleSmall,
-                                    color = InkBlack
+                                    color = InkBlack,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
                                 )
                             }
                             LinearProgressIndicator(

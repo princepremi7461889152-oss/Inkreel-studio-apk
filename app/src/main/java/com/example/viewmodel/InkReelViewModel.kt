@@ -27,7 +27,11 @@ import com.example.model.ReelProject
 import com.example.model.ReelShot
 import com.example.model.RoomSetting
 import com.example.model.SpeakerSlot
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,7 +39,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sin
 
 enum class StageViewMode { YOUR_REEL, REFERENCE_CLIP }
@@ -85,8 +95,8 @@ class InkReelViewModel(
     val apiKey: StateFlow<String> = repository.apiKeyFlow
     val savedReels: StateFlow<List<ReelProject>> = repository.savedReels
 
-    private val shotAudioMap = mutableMapOf<String, ByteArray>()
-    private val shotEnvelopeMap = mutableMapOf<String, FloatArray>()
+    private val shotAudioMap = ConcurrentHashMap<String, ByteArray>()
+    private val shotEnvelopeMap = ConcurrentHashMap<String, FloatArray>()
 
     private val livePlayer = LiveReelAudioPlayer()
     private val micRecorder = MicVoiceRecorder()
@@ -96,6 +106,7 @@ class InkReelViewModel(
 
     init {
         voiceJob = viewModelScope.launch {
+            deviceTts.warmUp()
             ensureMissingVoicesInternal(preferGeminiIfKeySet = false)
         }
     }
@@ -207,7 +218,7 @@ class InkReelViewModel(
             val state = _uiState.value
             val total = state.project.totalDurationMs
             val startFrom = if (state.playheadMs >= total - 50L) 0L else state.playheadMs
-            _uiState.update { it.copy(isPlaying = true, playheadMs = startFrom) }
+            _uiState.update { it.copy(isPlaying = true, playheadMs = startFrom, errorBanner = null) }
 
             val mixedPcm = ProceduralAudioEngine.mixReelAudio(
                 project = state.project,
@@ -295,12 +306,16 @@ class InkReelViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isBrainstorming = true, errorBanner = null) }
             val result = geminiService.brainstormHooks(key, niche, twist, language)
-            result.onSuccess { hooks ->
+            result.onSuccess { outcome ->
                 _uiState.update {
                     it.copy(
                         isBrainstorming = false,
-                        brainstormedHooks = hooks,
-                        statusBanner = "Generated ${hooks.size} viral comedy hooks."
+                        brainstormedHooks = outcome.data,
+                        statusBanner = if (outcome.usedFallback) {
+                            "${outcome.fallbackReason} — loaded ${outcome.data.size} instant comedy hooks."
+                        } else {
+                            "Generated ${outcome.data.size} viral comedy hooks."
+                        }
                     )
                 }
             }.onFailure { err ->
@@ -335,7 +350,8 @@ class InkReelViewModel(
                 clonedBlueprint = _uiState.value.clonedStyleBlueprint,
                 baseProject = _uiState.value.project
             )
-            result.onSuccess { newProject ->
+            result.onSuccess { outcome ->
+                val newProject = outcome.data
                 shotAudioMap.clear()
                 shotEnvelopeMap.clear()
                 _uiState.update {
@@ -347,7 +363,12 @@ class InkReelViewModel(
                         playheadMs = 0L,
                         stageViewMode = StageViewMode.YOUR_REEL,
                         isGeneratingReel = false,
-                        statusBanner = "Video storyboard ready! Synthesizing cast voices..."
+                        errorBanner = null,
+                        statusBanner = if (outcome.usedFallback) {
+                            "${outcome.fallbackReason} — generated instant comedy reel! Preparing cast voices..."
+                        } else {
+                            "Video storyboard ready! Synthesizing cast voices..."
+                        }
                     )
                 }
                 synthesizeAllSpokenShots()
@@ -443,32 +464,62 @@ class InkReelViewModel(
         voiceJob?.cancel()
         voiceJob = viewModelScope.launch {
             val key = repository.getApiKey()
-            _uiState.update { it.copy(isSynthesizingAllVoices = true, errorBanner = null) }
-            val shots = _uiState.value.project.shots
-            var geminiCount = 0
-            var deviceCount = 0
-
-            for (shot in shots) {
-                if (!isActive) break
-                if (shot.speaker != SpeakerSlot.SILENT && shot.dialogue.isNotBlank()) {
-                    val outcome = synthesizeShotWithFallback(apiKey = key, shotId = shot.shotId)
-                    if (outcome == VoiceSourceResult.GEMINI) geminiCount++
-                    else if (outcome == VoiceSourceResult.DEVICE) deviceCount++
-                }
+            val spokenShots = _uiState.value.project.shots.filter {
+                it.speaker != SpeakerSlot.SILENT && it.dialogue.isNotBlank()
             }
-            val totalVoiced = geminiCount + deviceCount
-            _uiState.update {
-                it.copy(
-                    isSynthesizingAllVoices = false,
-                    hasGeneratedReel = true,
-                    statusBanner = when {
-                        geminiCount > 0 && deviceCount == 0 ->
-                            "Voiced all $geminiCount shots with Gemini AI Voice! Tap Play or Download MP4."
-                        totalVoiced > 0 ->
-                            "Voiced all $totalVoiced shots ($geminiCount Gemini, $deviceCount Device Voice). Ready to Play or Download!"
-                        else -> it.statusBanner
-                    }
-                )
+            if (spokenShots.isEmpty()) {
+                _uiState.update { it.copy(isSynthesizingAllVoices = false) }
+                return@launch
+            }
+
+            _uiState.update { it.copy(isSynthesizingAllVoices = true, errorBanner = null) }
+            val geminiCount = AtomicInteger(0)
+            val deviceCount = AtomicInteger(0)
+            val synthCount = AtomicInteger(0)
+            val geminiAllowed = AtomicBoolean(key.isNotBlank())
+            val limiter = Semaphore(permits = 4)
+
+            try {
+                coroutineScope {
+                    spokenShots.map { shot ->
+                        async {
+                            if (!isActive) return@async
+                            limiter.withPermit {
+                                if (!isActive) return@withPermit
+                                when (synthesizeShotWithFallback(
+                                    apiKey = if (geminiAllowed.get()) key else "",
+                                    shotId = shot.shotId,
+                                    geminiTtsAllowed = geminiAllowed
+                                )) {
+                                    VoiceSourceResult.GEMINI -> geminiCount.incrementAndGet()
+                                    VoiceSourceResult.DEVICE -> deviceCount.incrementAndGet()
+                                    VoiceSourceResult.CARTOON_SYNTH -> synthCount.incrementAndGet()
+                                    VoiceSourceResult.FAILED -> Unit
+                                }
+                            }
+                        }
+                    }.awaitAll()
+                }
+
+                val gCount = geminiCount.get()
+                val dCount = deviceCount.get()
+                val cCount = synthCount.get()
+                val totalVoiced = gCount + dCount + cCount
+                _uiState.update {
+                    it.copy(
+                        hasGeneratedReel = true,
+                        errorBanner = null,
+                        statusBanner = when {
+                            gCount > 0 && dCount == 0 && cCount == 0 ->
+                                "Voiced all $gCount shots with Gemini AI Voice! Tap Play or Download MP4."
+                            totalVoiced > 0 ->
+                                "Voiced all $totalVoiced shots ($gCount Gemini, $dCount Device, $cCount Synth). Ready to Play or Download!"
+                            else -> it.statusBanner
+                        }
+                    )
+                }
+            } finally {
+                _uiState.update { it.copy(isSynthesizingAllVoices = false) }
             }
         }
     }
@@ -476,12 +527,22 @@ class InkReelViewModel(
     fun revoiceShot(shotId: String) {
         viewModelScope.launch {
             val key = repository.getApiKey()
-            val outcome = synthesizeShotWithFallback(apiKey = key, shotId = shotId)
+            val outcome = synthesizeShotWithFallback(
+                apiKey = key,
+                shotId = shotId,
+                geminiTtsAllowed = AtomicBoolean(key.isNotBlank())
+            )
             if (outcome != VoiceSourceResult.FAILED) {
-                val label = if (outcome == VoiceSourceResult.GEMINI) "Gemini AI Voice" else "Device Voice"
+                val label = when (outcome) {
+                    VoiceSourceResult.GEMINI -> "Gemini AI Voice"
+                    VoiceSourceResult.DEVICE -> "Device Voice"
+                    VoiceSourceResult.CARTOON_SYNTH -> "Expressive Cartoon Synth"
+                    VoiceSourceResult.FAILED -> ""
+                }
                 _uiState.update {
                     it.copy(
                         lastMp4Export = null,
+                        errorBanner = null,
                         statusBanner = "Shot voiced ($label) & lip-synced."
                     )
                 }
@@ -495,18 +556,54 @@ class InkReelViewModel(
         val missing = shots.filter {
             it.speaker != SpeakerSlot.SILENT && it.dialogue.isNotBlank() && !shotAudioMap.containsKey(it.shotId)
         }
-        if (missing.isEmpty()) return
+        if (missing.isEmpty()) {
+            _uiState.update { it.copy(isSynthesizingAllVoices = false) }
+            return
+        }
 
         _uiState.update { it.copy(isSynthesizingAllVoices = true) }
-        for (shot in missing) {
-            synthesizeShotWithFallback(apiKey = key, shotId = shot.shotId)
+        val geminiAllowed = AtomicBoolean(key.isNotBlank())
+        val limiter = Semaphore(permits = 4)
+        try {
+            coroutineScope {
+                missing.map { shot ->
+                    async {
+                        limiter.withPermit {
+                            synthesizeShotWithFallback(
+                                apiKey = if (geminiAllowed.get()) key else "",
+                                shotId = shot.shotId,
+                                geminiTtsAllowed = geminiAllowed
+                            )
+                        }
+                    }
+                }.awaitAll()
+            }
+        } finally {
+            _uiState.update { it.copy(isSynthesizingAllVoices = false) }
         }
-        _uiState.update { it.copy(isSynthesizingAllVoices = false) }
     }
 
-    private enum class VoiceSourceResult { GEMINI, DEVICE, FAILED }
+    private enum class VoiceSourceResult { GEMINI, DEVICE, CARTOON_SYNTH, FAILED }
 
-    private suspend fun synthesizeShotWithFallback(apiKey: String, shotId: String): VoiceSourceResult {
+    private fun isFatalGeminiTtsError(message: String?): Boolean {
+        val msg = message.orEmpty()
+        return msg.contains("no longer available", ignoreCase = true) ||
+            msg.contains("not found", ignoreCase = true) ||
+            msg.contains("HTTP 404", ignoreCase = true) ||
+            msg.contains("HTTP 403", ignoreCase = true) ||
+            msg.contains("HTTP 401", ignoreCase = true) ||
+            msg.contains("HTTP 429", ignoreCase = true) ||
+            msg.contains("API key", ignoreCase = true) ||
+            msg.contains("quota", ignoreCase = true) ||
+            msg.contains("rate limit", ignoreCase = true) ||
+            msg.contains("PERMISSION_DENIED", ignoreCase = true)
+    }
+
+    private suspend fun synthesizeShotWithFallback(
+        apiKey: String,
+        shotId: String,
+        geminiTtsAllowed: AtomicBoolean
+    ): VoiceSourceResult {
         val current = _uiState.value.project
         val shot = current.shots.firstOrNull { it.shotId == shotId } ?: return VoiceSourceResult.FAILED
         if (shot.speaker == SpeakerSlot.SILENT || shot.dialogue.isBlank()) return VoiceSourceResult.FAILED
@@ -519,46 +616,52 @@ class InkReelViewModel(
         _uiState.update { it.copy(voicingShotIds = it.voicingShotIds + shotId) }
 
         var resultSource = VoiceSourceResult.FAILED
-        var lastError: String? = null
-
-        if (apiKey.isNotBlank()) {
-            val geminiRes = geminiService.synthesizeShotVoice(
-                apiKey = apiKey,
-                dialogue = shot.phoneticHint.ifBlank { shot.dialogue },
-                voiceName = voiceName,
-                moodPose = shot.moodPose
-            )
-            geminiRes.onSuccess { synth ->
-                applyShotPcm(shotId, synth.pcmBytes, synth.rawDurationMs, speed, "Gemini TTS ($voiceName)")
-                resultSource = VoiceSourceResult.GEMINI
-            }.onFailure { err ->
-                lastError = err.localizedMessage
+        try {
+            if (apiKey.isNotBlank() && geminiTtsAllowed.get()) {
+                val geminiRes = geminiService.synthesizeShotVoice(
+                    apiKey = apiKey,
+                    dialogue = shot.phoneticHint.ifBlank { shot.dialogue },
+                    voiceName = voiceName,
+                    moodPose = shot.moodPose
+                )
+                geminiRes.onSuccess { synth ->
+                    applyShotPcm(shotId, synth.pcmBytes, synth.rawDurationMs, speed, "Gemini TTS ($voiceName)")
+                    resultSource = VoiceSourceResult.GEMINI
+                }.onFailure { err ->
+                    if (isFatalGeminiTtsError(err.localizedMessage)) {
+                        geminiTtsAllowed.set(false)
+                    }
+                }
             }
-        }
 
-        if (resultSource == VoiceSourceResult.FAILED) {
-            val deviceRes = deviceTts.synthesizeShotVoice(
-                dialogue = shot.dialogue,
-                phoneticHint = shot.phoneticHint,
-                gender = gender,
-                language = current.language,
-                moodPose = shot.moodPose
-            )
-            deviceRes.onSuccess { synth ->
-                val tag = if (gender == CharacterGender.FEMALE) "Device Voice (Girl)" else "Device Voice (Boy)"
-                applyShotPcm(shotId, synth.pcmBytes, synth.rawDurationMs, speed, tag)
-                resultSource = VoiceSourceResult.DEVICE
-            }.onFailure { err ->
-                if (lastError == null) lastError = err.localizedMessage
+            if (resultSource == VoiceSourceResult.FAILED) {
+                val deviceRes = deviceTts.synthesizeShotVoice(
+                    dialogue = shot.dialogue,
+                    phoneticHint = shot.phoneticHint,
+                    gender = gender,
+                    language = current.language,
+                    moodPose = shot.moodPose
+                )
+                deviceRes.onSuccess { synth ->
+                    val tag = if (gender == CharacterGender.FEMALE) "Device Voice (Girl)" else "Device Voice (Boy)"
+                    applyShotPcm(shotId, synth.pcmBytes, synth.rawDurationMs, speed, tag)
+                    resultSource = VoiceSourceResult.DEVICE
+                }
             }
-        }
 
-        _uiState.update { it.copy(voicingShotIds = it.voicingShotIds - shotId) }
-
-        if (resultSource == VoiceSourceResult.FAILED && lastError != null) {
-            _uiState.update {
-                it.copy(errorBanner = "Voice synthesis failed: $lastError")
+            // 3rd-tier guaranteed local cartoon voice synth so Device TTS empty audio never breaks reels
+            if (resultSource == VoiceSourceResult.FAILED) {
+                val fallbackSynth = ProceduralAudioEngine.synthesizeCartoonVoiceFallback(
+                    text = shot.dialogue,
+                    gender = gender,
+                    moodPose = shot.moodPose
+                )
+                val tag = if (gender == CharacterGender.FEMALE) "Cartoon Synth (Girl)" else "Cartoon Synth (Boy)"
+                applyShotPcm(shotId, fallbackSynth.pcmBytes, fallbackSynth.rawDurationMs, speed, tag)
+                resultSource = VoiceSourceResult.CARTOON_SYNTH
             }
+        } finally {
+            _uiState.update { it.copy(voicingShotIds = it.voicingShotIds - shotId) }
         }
         return resultSource
     }
@@ -571,10 +674,16 @@ class InkReelViewModel(
         sourceLabel: String
     ) {
         val current = _uiState.value.project
+        val env = withContext(Dispatchers.Default) {
+            repository.computeEnvelope30Fps(pcmBytes)
+        }
         shotAudioMap[shotId] = pcmBytes
-        shotEnvelopeMap[shotId] = repository.computeEnvelope30Fps(pcmBytes)
+        shotEnvelopeMap[shotId] = env
+
         val projKey = current.id.ifBlank { "draft" }
-        repository.saveShotAudioPcm(projKey, shotId, pcmBytes)
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.saveShotAudioPcm(projKey, shotId, pcmBytes)
+        }
 
         // Allow up to 30 seconds per shot so long lines never get cut off mid-sentence
         val adjustedMs = ((rawDurationMs / speed).toLong() + 350L).coerceIn(1100L, 30000L)
@@ -842,37 +951,39 @@ class InkReelViewModel(
         pausePlayback()
         viewModelScope.launch {
             _uiState.update { it.copy(isExportingMp4 = true, exportProgress = 0.02f, errorBanner = null) }
-            voiceJob?.cancel()
-            ensureMissingVoicesInternal(preferGeminiIfKeySet = false)
+            try {
+                voiceJob?.cancel()
+                ensureMissingVoicesInternal(preferGeminiIfKeySet = false)
 
-            val state = _uiState.value
-            val res = Mp4Exporter.exportMp4(
-                context = context.applicationContext,
-                project = state.project,
-                shotAudioMap = shotAudioMap.toMap(),
-                isMuted = state.isMuted,
-                showCaptions = state.showCaptions,
-                showSpeechBubbles = state.showSpeechBubbles,
-                onProgress = { p -> _uiState.update { it.copy(exportProgress = p) } }
-            )
-            res.onSuccess { exp ->
-                _uiState.update {
-                    it.copy(
-                        isExportingMp4 = false,
-                        exportProgress = 1f,
-                        lastExportResult = exp,
-                        lastMp4Export = exp,
-                        statusBanner = "Video downloaded to ${exp.displayPath}"
-                    )
+                val state = _uiState.value
+                val res = Mp4Exporter.exportMp4(
+                    context = context.applicationContext,
+                    project = state.project,
+                    shotAudioMap = shotAudioMap.toMap(),
+                    isMuted = state.isMuted,
+                    showCaptions = state.showCaptions,
+                    showSpeechBubbles = state.showSpeechBubbles,
+                    onProgress = { p -> _uiState.update { it.copy(exportProgress = p) } }
+                )
+                res.onSuccess { exp ->
+                    _uiState.update {
+                        it.copy(
+                            exportProgress = 1f,
+                            lastExportResult = exp,
+                            lastMp4Export = exp,
+                            statusBanner = "Video downloaded to ${exp.displayPath}"
+                        )
+                    }
+                }.onFailure { err ->
+                    _uiState.update {
+                        it.copy(
+                            exportProgress = 0f,
+                            errorBanner = err.localizedMessage ?: "MP4 export failed."
+                        )
+                    }
                 }
-            }.onFailure { err ->
-                _uiState.update {
-                    it.copy(
-                        isExportingMp4 = false,
-                        exportProgress = 0f,
-                        errorBanner = err.localizedMessage ?: "MP4 export failed."
-                    )
-                }
+            } finally {
+                _uiState.update { it.copy(isExportingMp4 = false) }
             }
         }
     }
