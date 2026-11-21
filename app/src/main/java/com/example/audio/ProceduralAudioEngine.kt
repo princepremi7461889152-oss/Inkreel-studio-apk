@@ -167,9 +167,10 @@ object ProceduralAudioEngine {
             val shotSamples = ((shot.durationMs / 1000.0) * SAMPLE_RATE).toInt().coerceAtLeast(1)
             val charSpeed = project.characterFor(shot.speaker)?.voiceSpeed ?: 1.0f
 
-            // 1. Place character voiceover (if any)
+            // 1. Place character voiceover (if any) with clear foreground presence
             val rawVoicePcm = shotAudioMap[shot.shotId]
-            if (rawVoicePcm != null && rawVoicePcm.size >= 2 && shot.speaker != SpeakerSlot.SILENT) {
+            val hasVoice = rawVoicePcm != null && rawVoicePcm.size >= 2 && shot.speaker != SpeakerSlot.SILENT
+            if (hasVoice && rawVoicePcm != null) {
                 val rawCount = rawVoicePcm.size / 2
                 val speed = charSpeed.coerceIn(0.85f, 1.30f)
                 val resampledCount = (rawCount / speed).toInt().coerceAtMost(shotSamples)
@@ -179,17 +180,25 @@ object ProceduralAudioEngine {
                     val srcPos = i * speed
                     val idx0 = srcPos.toInt().coerceIn(0, rawCount - 1)
                     val s0 = readPcmSample(rawVoicePcm, idx0)
-                    mix[dst] += s0 * 0.95f
+                    mix[dst] += s0 * 1.12f
                     speechActivity[dst] = true
                 }
             }
 
-            // 2. Place triggered Comic SFX at shot start
+            // 2. Place triggered Comic SFX: subtle & brief behind dialogue so it never replaces or drowns voice
             val sfxSamples = synthesizeSfxSamples(shot.sfx)
-            for (i in sfxSamples.indices) {
-                val dst = cursorSample + i
-                if (dst >= totalSamples) break
-                mix[dst] += sfxSamples[i] * 0.72f
+            if (sfxSamples.isNotEmpty()) {
+                val maxSfxSamples = if (hasVoice) (SAMPLE_RATE * 0.38).toInt() else sfxSamples.size
+                val sfxLimit = minOf(sfxSamples.size, maxSfxSamples)
+                val sfxGain = if (hasVoice) 0.22f else 0.62f
+                for (i in 0 until sfxLimit) {
+                    val dst = cursorSample + i
+                    if (dst >= totalSamples) break
+                    val fadeOut = if (hasVoice && i > (sfxLimit * 0.6f)) {
+                        ((sfxLimit - i).toFloat() / (sfxLimit * 0.4f).coerceAtLeast(1f)).coerceIn(0f, 1f)
+                    } else 1f
+                    mix[dst] += sfxSamples[i] * sfxGain * fadeOut
+                }
             }
 
             cursorSample += shotSamples
@@ -201,16 +210,16 @@ object ProceduralAudioEngine {
             for (i in outroSfx.indices) {
                 val dst = cursorSample + i
                 if (dst >= totalSamples) break
-                mix[dst] += outroSfx[i] * 0.65f
+                mix[dst] += outroSfx[i] * 0.55f
             }
         }
 
-        // 3. Add procedural BGM with smooth automatic ducking during speech
-        val baseBgmGain = project.bgmVolume.coerceIn(0f, 1f) * 0.48f
+        // 3. Add procedural BGM with deeper automatic ducking during speech so voice is crystal clear
+        val baseBgmGain = project.bgmVolume.coerceIn(0f, 1f) * 0.42f
         var duckEnvelope = 1.0f
         for (i in 0 until totalSamples) {
-            val targetDuck = if (speechActivity[i]) 0.22f else 1.0f
-            duckEnvelope += (targetDuck - duckEnvelope) * 0.004f
+            val targetDuck = if (speechActivity[i]) 0.14f else 1.0f
+            duckEnvelope += (targetDuck - duckEnvelope) * 0.005f
             val bgm = synthesizeBgmSample(project.bgmMood, i.toDouble() / SAMPLE_RATE)
             mix[i] += bgm * baseBgmGain * duckEnvelope
         }
@@ -255,47 +264,51 @@ object ProceduralAudioEngine {
         val totalSamples = ((durationMs / 1000.0) * SAMPLE_RATE).toInt().coerceAtLeast(SAMPLE_RATE)
         val out = ByteArray(totalSamples * 2)
 
-        val baseFreq = if (gender == CharacterGender.FEMALE) 235.0 else 132.0
+        val baseFreq = if (gender == CharacterGender.FEMALE) 225.0 else 126.0
         val moodBoost = when (moodPose) {
-            MoodPose.SHOCKED, MoodPose.FURIOUS, MoodPose.ANGRY -> 1.12
-            MoodPose.DEADPAN -> 0.90
+            MoodPose.SHOCKED, MoodPose.FURIOUS, MoodPose.ANGRY -> 1.08
+            MoodPose.DEADPAN -> 0.92
             else -> 1.0
         }
         val syllableRateHz = when (moodPose) {
-            MoodPose.NERVOUS, MoodPose.SWEATING, MoodPose.FURIOUS -> 6.8
-            MoodPose.DEADPAN -> 4.2
-            else -> 5.4
+            MoodPose.NERVOUS, MoodPose.SWEATING, MoodPose.FURIOUS -> 5.8
+            MoodPose.DEADPAN -> 3.8
+            else -> 4.6
         }
 
         val rng = Random(text.hashCode())
         var phase1 = 0.0
-        var phase2 = 0.0
-        val fadeSamples = (0.04 * SAMPLE_RATE).toInt().coerceAtLeast(1)
+        val fadeSamples = (0.045 * SAMPLE_RATE).toInt().coerceAtLeast(1)
 
         for (i in 0 until totalSamples) {
             val t = i.toDouble() / SAMPLE_RATE
             val syllPhase = (t * syllableRateHz) % 1.0
             val syllIndex = (t * syllableRateHz).toInt()
-            // Brief consonant pauses between words/syllables give crisp lip-sync modulation
-            val isPause = ((syllIndex % 5) == 4 && syllPhase > 0.55)
+            // Natural word cadence with soft breath pauses instead of sharp buzzes
+            val isPause = ((syllIndex % 4) == 3 && syllPhase > 0.45)
             val env = if (isPause) {
-                0.04
+                0.02
             } else {
-                sin(PI * syllPhase).coerceAtLeast(0.0)
+                val attack = (syllPhase / 0.18).coerceIn(0.0, 1.0)
+                val release = ((1.0 - syllPhase) / 0.28).coerceIn(0.0, 1.0)
+                attack * release
             }
-            val inflection = 1.0 + 0.14 * sin(t * 7.5 + (syllIndex % 3))
+            val inflection = 1.0 + 0.08 * sin(t * 5.2 + (syllIndex % 3)) - 0.05 * (t / (durationMs / 1000.0))
             val f0 = baseFreq * moodBoost * inflection
             phase1 += 2.0 * PI * f0 / SAMPLE_RATE
-            phase2 += 2.0 * PI * (f0 * 2.25) / SAMPLE_RATE
 
-            val vocal = (sin(phase1) * 0.58 + sin(phase2) * 0.24 + sin(phase1 * 3.0) * 0.12)
-            val breath = (rng.nextDouble() * 2.0 - 1.0) * 0.04
+            // Harmonic integer-multiple vocal formants (1f, 2f, 3f, 4f) — avoids metallic SFX inharmonics
+            val vocal = sin(phase1) * 0.45 +
+                sin(phase1 * 2.0) * 0.28 +
+                sin(phase1 * 3.0) * 0.14 +
+                sin(phase1 * 4.0) * 0.06
+            val breath = (rng.nextDouble() * 2.0 - 1.0) * 0.025
             val edgeGain = when {
                 i < fadeSamples -> i.toDouble() / fadeSamples
                 i > totalSamples - fadeSamples -> (totalSamples - i).toDouble() / fadeSamples
                 else -> 1.0
             }
-            val sample = ((vocal + breath) * env * edgeGain * 0.62).toFloat().coerceIn(-1f, 1f)
+            val sample = ((vocal + breath) * env * edgeGain * 0.40).toFloat().coerceIn(-1f, 1f)
             val pcm = (sample * 32767f).toInt().coerceIn(-32768, 32767)
             out[i * 2] = (pcm and 0xFF).toByte()
             out[i * 2 + 1] = ((pcm shr 8) and 0xFF).toByte()

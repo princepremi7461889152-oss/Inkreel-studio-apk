@@ -472,12 +472,13 @@ class InkReelViewModel(
                 return@launch
             }
 
+            deviceTts.clearCooldown()
             _uiState.update { it.copy(isSynthesizingAllVoices = true, errorBanner = null) }
             val geminiCount = AtomicInteger(0)
             val deviceCount = AtomicInteger(0)
             val synthCount = AtomicInteger(0)
             val geminiAllowed = AtomicBoolean(key.isNotBlank())
-            val limiter = Semaphore(permits = 4)
+            val limiter = Semaphore(permits = 2)
 
             try {
                 coroutineScope {
@@ -563,7 +564,7 @@ class InkReelViewModel(
 
         _uiState.update { it.copy(isSynthesizingAllVoices = true) }
         val geminiAllowed = AtomicBoolean(key.isNotBlank())
-        val limiter = Semaphore(permits = 4)
+        val limiter = Semaphore(permits = 2)
         try {
             coroutineScope {
                 missing.map { shot ->
@@ -593,6 +594,8 @@ class InkReelViewModel(
             msg.contains("HTTP 403", ignoreCase = true) ||
             msg.contains("HTTP 401", ignoreCase = true) ||
             msg.contains("HTTP 429", ignoreCase = true) ||
+            msg.contains("HTTP 503", ignoreCase = true) ||
+            msg.contains("high demand", ignoreCase = true) ||
             msg.contains("API key", ignoreCase = true) ||
             msg.contains("quota", ignoreCase = true) ||
             msg.contains("rate limit", ignoreCase = true) ||

@@ -159,6 +159,42 @@ class InkReelBugFixTest {
         val mixed = ProceduralAudioEngine.mixReelAudio(proj, audioMap, isMuted = false)
         assertTrue(mixed.size > 48000)
         assertTrue(mixed.any { it != 0.toByte() })
+
+        // Verify spoken voice stays stronger than background SFX on spoken shots
+        val loudVoicePcm = ByteArray(24000 * 2) // 1s steady 0.6 amplitude wave
+        for (i in 0 until 24000) {
+            val v = (kotlin.math.sin(2.0 * kotlin.math.PI * 220.0 * i / 24000.0) * 0.6 * 32767.0).toInt()
+            loudVoicePcm[i * 2] = (v and 0xFF).toByte()
+            loudVoicePcm[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        val singleShotProj = ReelProject(
+            bgmVolume = 0.25f,
+            enableOutro = false,
+            shots = listOf(
+                proj.shots.first().copy(
+                    shotId = "voice_test",
+                    speaker = SpeakerSlot.B,
+                    sfx = com.example.model.ComicSfx.SAD_VIOLIN,
+                    durationMs = 1500L
+                )
+            )
+        )
+        val sfxOnly = ProceduralAudioEngine.mixReelAudio(singleShotProj, emptyMap(), isMuted = false)
+        val withVoice = ProceduralAudioEngine.mixReelAudio(singleShotProj, mapOf("voice_test" to loudVoicePcm), isMuted = false)
+
+        fun rmsPeak(pcm: ByteArray, startSample: Int, endSample: Int): Double {
+            var sumSq = 0.0
+            for (i in startSample until endSample) {
+                val lo = pcm[i * 2].toInt() and 0xFF
+                val hi = pcm[i * 2 + 1].toInt()
+                val s = ((hi shl 8) or lo).toShort().toDouble() / 32768.0
+                sumSq += s * s
+            }
+            return kotlin.math.sqrt(sumSq / (endSample - startSample).coerceAtLeast(1))
+        }
+        val voiceRms = rmsPeak(withVoice, 1000, 20000)
+        val bgOnlyRms = rmsPeak(sfxOnly, 1000, 20000)
+        assertTrue("Spoken voice ($voiceRms) must clearly dominate over SFX/BGM ($bgOnlyRms)", voiceRms > bgOnlyRms * 2.0)
     }
 
     @Test

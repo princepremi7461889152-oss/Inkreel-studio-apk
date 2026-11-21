@@ -453,9 +453,10 @@ class GeminiInkReelService {
         }
         val retriever = MediaMetadataRetriever()
         val bitmaps = mutableListOf<Bitmap>()
+        var durationMs = 15_000L
         try {
             retriever.setDataSource(context, videoUri)
-            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 15_000L
             val frameCount = 8
             val stepUs = ((durationMs * 1000L) / (frameCount + 1)).coerceAtLeast(200_000L)
@@ -534,8 +535,27 @@ class GeminiInkReelService {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "analyzeReferenceVideoStyle failed", e)
-            Result.failure(e)
+            Log.w(TAG, "analyzeReferenceVideoStyle Gemini unavailable, using local pacing blueprint", e)
+            if (isRecoverableBusyOrNetworkError(e)) {
+                val avgShotMs = (durationMs / bitmaps.size.coerceAtLeast(4)).coerceIn(1400L, 2800L)
+                Result.success(
+                    ClonedStyleBlueprint(
+                        summary = "Fast 9:16 comedy pacing (${bitmaps.size} keyframes analyzed, ~${avgShotMs / 1000f}s/shot)",
+                        averageShotDurationMs = avgShotMs,
+                        pacingStyle = "Rapid Escalation & Surprise Cut",
+                        recommendedFramings = listOf(
+                            CameraFraming.WIDE_DOORWAY.name,
+                            CameraFraming.CLOSE_UP_B.name,
+                            CameraFraming.DESK_SLAM.name,
+                            CameraFraming.SPLIT_PHONE_CALL.name,
+                            CameraFraming.SLAPSTICK_CHASE.name
+                        ),
+                        comedyFormula = "Hook Setup -> Escalate Tension -> Unexpected Reversal -> Chase Punchline"
+                    )
+                )
+            } else {
+                Result.failure(e)
+            }
         } finally {
             runCatching { retriever.release() }
             bitmaps.forEach { if (!it.isRecycled) it.recycle() }
@@ -581,8 +601,21 @@ class GeminiInkReelService {
                 })
             }
 
-            val responseJson = withTimeout(18_000L) {
-                callGeminiRest(apiKey, TTS_MODEL, body, readTimeoutMs = 16_000)
+            val responseJson = withTimeout(16_000L) {
+                try {
+                    callGeminiRest(apiKey, preferredTtsModel, body, readTimeoutMs = 14_000)
+                } catch (e: Exception) {
+                    val suggested = Regex("models/(gemini-[a-zA-Z0-9._-]+)").find(e.message.orEmpty())?.groupValues?.getOrNull(1)
+                    if (!suggested.isNullOrBlank() && suggested != preferredTtsModel &&
+                        (suggested.contains("tts", ignoreCase = true) || e.message.orEmpty().contains("no longer available", ignoreCase = true))
+                    ) {
+                        val retryRes = callGeminiRest(apiKey, suggested, body, readTimeoutMs = 14_000)
+                        preferredTtsModel = suggested
+                        retryRes
+                    } else {
+                        throw e
+                    }
+                }
             }
             val b64 = extractAudioBase64FromResponse(responseJson)
             val pcm = Base64.decode(b64, Base64.DEFAULT)
@@ -644,9 +677,8 @@ class GeminiInkReelService {
             listOf(
                 preferredTextModel,
                 TEXT_MODEL,
-                "gemini-2.5-flash-lite",
-                "gemini-2.0-flash",
-                "gemini-2.5-flash"
+                "gemini-3-flash-preview",
+                "gemini-2.5-flash-lite"
             )
         )
         var lastError: Exception? = null
@@ -1785,6 +1817,8 @@ class GeminiInkReelService {
         private const val TTS_MODEL = "gemini-2.5-flash-preview-tts"
         @Volatile
         private var preferredTextModel = TEXT_MODEL
+        @Volatile
+        private var preferredTtsModel = TTS_MODEL
         private val storyVariationCounter = java.util.concurrent.atomic.AtomicInteger(0)
         private val recentGeneratedTitles = ArrayDeque<String>()
     }

@@ -79,8 +79,8 @@ object HinglishPhoneticTuner {
  */
 class DeviceTtsSynthesizer(
     context: Context,
-    private val initTimeoutMs: Long = 3_500L,
-    private val synthTimeoutMs: Long = 7_000L
+    private val initTimeoutMs: Long = 8_000L,
+    private val synthTimeoutMs: Long = 12_000L
 ) {
 
     private val appContext = context.applicationContext
@@ -93,12 +93,33 @@ class DeviceTtsSynthesizer(
     private var tts: TextToSpeech? = null
     private var initDeferred: CompletableDeferred<Boolean>? = null
 
+    fun clearCooldown() {
+        retryInitAfterMs = 0L
+    }
+
     suspend fun warmUp() {
         runCatching {
             synthMutex.withLock {
                 ensureInitialized()
             }
         }
+    }
+
+    private suspend fun createAndAwaitTts(enginePackage: String?): Pair<TextToSpeech, Boolean> {
+        val deferred = CompletableDeferred<Boolean>()
+        val instance = withContext(Dispatchers.Main) {
+            if (enginePackage != null) {
+                TextToSpeech(appContext, { status ->
+                    deferred.complete(status == TextToSpeech.SUCCESS)
+                }, enginePackage)
+            } else {
+                TextToSpeech(appContext) { status ->
+                    deferred.complete(status == TextToSpeech.SUCCESS)
+                }
+            }
+        }
+        val ok = withTimeoutOrNull(initTimeoutMs) { deferred.await() } ?: false
+        return instance to ok
     }
 
     private suspend fun ensureInitialized(): TextToSpeech? {
@@ -108,31 +129,35 @@ class DeviceTtsSynthesizer(
             return if (existingInit.await()) existing else null
         }
 
-        // Avoid repeating multi-second hangs across 7+ shots when the device TTS engine is missing/broken
         val nowMs = System.currentTimeMillis()
         if (nowMs < retryInitAfterMs) {
             return null
         }
 
-        val deferred = CompletableDeferred<Boolean>()
-        initDeferred = deferred
+        // 1. Try system default TTS engine
+        val (defaultInstance, defaultOk) = createAndAwaitTts(enginePackage = null)
+        if (defaultOk) {
+            retryInitAfterMs = 0L
+            tts = defaultInstance
+            initDeferred = CompletableDeferred(true)
+            return defaultInstance
+        }
+        runCatching { defaultInstance.shutdown() }
 
-        val instance = withContext(Dispatchers.Main) {
-            TextToSpeech(appContext) { status ->
-                deferred.complete(status == TextToSpeech.SUCCESS)
-            }
+        // 2. Fallback explicitly to Google Speech Services on OEM devices (Xiaomi/MIUI, etc.)
+        val (googleInstance, googleOk) = createAndAwaitTts(enginePackage = "com.google.android.tts")
+        if (googleOk) {
+            retryInitAfterMs = 0L
+            tts = googleInstance
+            initDeferred = CompletableDeferred(true)
+            return googleInstance
         }
-        tts = instance
-        val ok = withTimeoutOrNull(initTimeoutMs) { deferred.await() } ?: false
-        if (!ok) {
-            retryInitAfterMs = System.currentTimeMillis() + 60_000L
-            tts = null
-            initDeferred = null
-            runCatching { instance.shutdown() }
-            return null
-        }
-        retryInitAfterMs = 0L
-        return instance
+        runCatching { googleInstance.shutdown() }
+
+        retryInitAfterMs = System.currentTimeMillis() + 15_000L
+        tts = null
+        initDeferred = null
+        return null
     }
 
     private fun isVoiceInstalledAndOffline(v: android.speech.tts.Voice): Boolean {
@@ -186,6 +211,16 @@ class DeviceTtsSynthesizer(
         return cachedVoices[key]
     }
 
+    private fun sanitizeForSpeech(text: String): String {
+        return text
+            .replace(Regex("[?!]{2,}"), "!")
+            .replace("—", ", ")
+            .replace("...", ", ")
+            .replace(Regex("[^\\p{L}\\p{N}\\p{M}.,!?'\"\\s-]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
     private data class WavAttempt(val bytes: ByteArray?, val timedOut: Boolean)
 
     private suspend fun synthesizeToWavBytesOnce(
@@ -216,11 +251,26 @@ class DeviceTtsSynthesizer(
         if (res != TextToSpeech.SUCCESS) return WavAttempt(null, timedOut = false)
         val ok = withTimeoutOrNull(synthTimeoutMs) { done.await() }
         if (ok == null) {
-            // Do not wait another full synthTimeoutMs on retry if the OS TTS callback hung
             return WavAttempt(null, timedOut = true)
         }
         if (!ok || !outFile.exists() || outFile.length() < 64L) return WavAttempt(null, timedOut = false)
         return WavAttempt(outFile.readBytes(), timedOut = false)
+    }
+
+    private fun hasAudibleSpeech(pcm24k: ByteArray): Boolean {
+        if (pcm24k.size < 400) return false
+        var peak = 0
+        val sampleCount = pcm24k.size / 2
+        val step = (sampleCount / 512).coerceAtLeast(1)
+        var i = 0
+        while (i < sampleCount) {
+            val lo = pcm24k[i * 2].toInt() and 0xFF
+            val hi = pcm24k[i * 2 + 1].toInt()
+            val amp = kotlin.math.abs(((hi shl 8) or lo).toShort().toInt())
+            if (amp > peak) peak = amp
+            i += step
+        }
+        return peak >= 48
     }
 
     suspend fun synthesizeShotVoice(
@@ -230,14 +280,13 @@ class DeviceTtsSynthesizer(
         language: String,
         moodPose: MoodPose
     ): Result<SynthesizedAudioResult> {
-        val spokenText = HinglishPhoneticTuner.tune(dialogue, phoneticHint, language)
+        val rawTuned = HinglishPhoneticTuner.tune(dialogue, phoneticHint, language)
+        val spokenText = sanitizeForSpeech(rawTuned).ifBlank { rawTuned.trim() }
         if (spokenText.isBlank()) {
             return Result.failure(IllegalArgumentException("Dialogue is empty."))
         }
 
-        // Hold lock only while Android TextToSpeech synthesizes the WAV file;
-        // release immediately so resampling runs concurrently with the next shot.
-        val wavBytes: ByteArray = synthMutex.withLock {
+        val pcm24k: ByteArray = synthMutex.withLock {
             withContext(Dispatchers.IO) {
                 val engine = ensureInitialized()
                     ?: return@withContext Result.failure<ByteArray>(IllegalStateException("Device TextToSpeech engine unavailable."))
@@ -261,8 +310,7 @@ class DeviceTtsSynthesizer(
                         runCatching { engine.voice = matched }
                     }
 
-                    // Pitch & rate tuned for Male vs Female & comedy emotion
-                    val basePitch = if (gender == CharacterGender.FEMALE) 1.24f else 0.92f
+                    val basePitch = if (gender == CharacterGender.FEMALE) 1.22f else 0.92f
                     val moodPitchBoost = when (moodPose) {
                         MoodPose.SHOCKED, MoodPose.FURIOUS -> 0.08f
                         MoodPose.DEADPAN -> -0.06f
@@ -271,30 +319,39 @@ class DeviceTtsSynthesizer(
                     engine.setPitch((basePitch + moodPitchBoost).coerceIn(0.65f, 1.55f))
 
                     val rate = when (moodPose) {
-                        MoodPose.NERVOUS, MoodPose.SWEATING, MoodPose.FURIOUS -> 1.10f
-                        MoodPose.DEADPAN -> 0.93f
+                        MoodPose.NERVOUS, MoodPose.SWEATING, MoodPose.FURIOUS -> 1.08f
+                        MoodPose.DEADPAN -> 0.94f
                         else -> 1.0f
                     }
                     engine.setSpeechRate(rate)
 
                     var attempt = synthesizeToWavBytesOnce(engine, spokenText, outFile)
+                    var decoded = attempt.bytes?.let { decodeWavTo24kMonoPcm(it) } ?: ByteArray(0)
 
-                    // Retry once with default Locale.US voice if an OEM/uninstalled voice produced empty audio promptly
-                    if (attempt.bytes == null && !attempt.timedOut) {
+                    // Retry with clean Locale.US/default voice if voice pack failed or returned silent audio
+                    if (!hasAudibleSpeech(decoded) && !attempt.timedOut) {
                         runCatching {
                             engine.setLanguage(Locale.US)
                             engine.defaultVoice?.let { def -> engine.voice = def }
                         }
                         attempt = synthesizeToWavBytesOnce(engine, spokenText, outFile)
+                        decoded = attempt.bytes?.let { decodeWavTo24kMonoPcm(it) } ?: ByteArray(0)
+                    }
+
+                    if (!hasAudibleSpeech(decoded) && !attempt.timedOut) {
+                        runCatching { engine.setLanguage(Locale.ENGLISH) }
+                        attempt = synthesizeToWavBytesOnce(engine, spokenText, outFile)
+                        decoded = attempt.bytes?.let { decodeWavTo24kMonoPcm(it) } ?: ByteArray(0)
                     }
 
                     if (attempt.timedOut) {
-                        retryInitAfterMs = System.currentTimeMillis() + 60_000L
+                        retryInitAfterMs = System.currentTimeMillis() + 15_000L
                     }
 
-                    val bytes = attempt.bytes
-                        ?: return@withContext Result.failure<ByteArray>(IllegalStateException("Device TTS generated empty audio."))
-                    Result.success(bytes)
+                    if (!hasAudibleSpeech(decoded)) {
+                        return@withContext Result.failure<ByteArray>(IllegalStateException("Device TTS generated empty audio."))
+                    }
+                    Result.success(decoded)
                 } catch (e: Exception) {
                     Log.w(TAG, "Device TTS synthesis failed", e)
                     Result.failure<ByteArray>(e)
@@ -304,15 +361,8 @@ class DeviceTtsSynthesizer(
             }
         }.getOrElse { return Result.failure(it) }
 
-        return withContext(Dispatchers.Default) {
-            val pcm24k = decodeWavTo24kMonoPcm(wavBytes)
-            if (pcm24k.size < 200) {
-                Result.failure(IllegalStateException("Decoded TTS audio was empty."))
-            } else {
-                val rawDurationMs = ((pcm24k.size.toDouble() / 48000.0) * 1000.0).toLong().coerceAtLeast(700L)
-                Result.success(SynthesizedAudioResult(pcmBytes = pcm24k, rawDurationMs = rawDurationMs))
-            }
-        }
+        val rawDurationMs = ((pcm24k.size.toDouble() / 48000.0) * 1000.0).toLong().coerceAtLeast(700L)
+        return Result.success(SynthesizedAudioResult(pcmBytes = pcm24k, rawDurationMs = rawDurationMs))
     }
 
     fun shutdown() {
